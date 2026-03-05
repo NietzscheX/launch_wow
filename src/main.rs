@@ -166,13 +166,74 @@ mod win_launcher {
         normalized
     }
 
-    fn resolve_config_path() -> PathBuf {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
-                return dir.join(CONFIG_FILE_NAME);
+    fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for path in paths {
+            let key = path.to_string_lossy().to_lowercase();
+            if seen.insert(key) {
+                out.push(path);
             }
         }
-        PathBuf::from(CONFIG_FILE_NAME)
+        out
+    }
+
+    fn config_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        // 1) 可选：显式路径覆盖
+        if let Ok(raw) = std::env::var("LAUNCH_WOW_CONFIG") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                candidates.push(PathBuf::from(trimmed));
+            }
+        }
+
+        // 2) exe 同目录（双击运行时最符合预期）
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                candidates.push(dir.join(CONFIG_FILE_NAME));
+            }
+        }
+
+        // 3) 当前工作目录
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join(CONFIG_FILE_NAME));
+        }
+
+        // 4) 最后兜底：相对路径
+        candidates.push(PathBuf::from(CONFIG_FILE_NAME));
+
+        dedup_paths(candidates)
+    }
+
+    fn find_existing_config() -> Option<PathBuf> {
+        config_candidates().into_iter().find(|path| path.exists())
+    }
+
+    fn create_default_config() -> Result<PathBuf, String> {
+        let default_content = default_config_template();
+        let targets = config_candidates();
+        let mut errors = Vec::new();
+
+        for target in targets {
+            if let Some(parent) = target.parent() {
+                if let Err(err) = fs::create_dir_all(parent) {
+                    errors.push(format!("创建目录失败 {}: {}", parent.display(), err));
+                    continue;
+                }
+            }
+
+            match fs::write(&target, &default_content) {
+                Ok(_) => return Ok(target),
+                Err(err) => errors.push(format!("写入失败 {}: {}", target.display(), err)),
+            }
+        }
+
+        Err(format!(
+            "无法自动创建配置文件 launch_wow.toml。尝试结果:\n{}",
+            errors.join("\n")
+        ))
     }
 
     fn resolve_wow_exe_path(wow_exe: &str, config_path: &Path) -> PathBuf {
@@ -240,13 +301,37 @@ mod win_launcher {
     }
 
     fn load_config() -> Result<(Config, PathBuf), String> {
-        let config_path = resolve_config_path();
+        let config_path = if let Some(path) = find_existing_config() {
+            path
+        } else {
+            let created = create_default_config()?;
+            println!("未找到配置文件，已生成默认配置: {}", created.display());
+            created
+        };
 
         if !config_path.exists() {
-            let default_content = default_config_template();
-            fs::write(&config_path, default_content)
-                .map_err(|err| format!("写入默认配置失败 ({}): {}", config_path.display(), err))?;
-            println!("未找到配置文件，已生成默认配置: {}", config_path.display());
+            return Err(format!(
+                "配置文件路径不存在: {}",
+                config_path.display()
+            ));
+        }
+
+        if fs::metadata(&config_path).is_err() {
+            return Err(format!(
+                "无法访问配置文件: {}",
+                config_path.display()
+            ));
+        }
+
+        if fs::read_to_string(&config_path).is_err() {
+            // 某些场景下文件刚创建后读取失败，再尝试一次写默认模板并读取。
+            if let Err(err) = fs::write(&config_path, default_config_template()) {
+                return Err(format!(
+                    "配置文件损坏且重写失败 ({}): {}",
+                    config_path.display(),
+                    err
+                ));
+            }
         }
 
         let config_text = fs::read_to_string(&config_path)
