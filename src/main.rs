@@ -7,15 +7,16 @@ mod win_launcher {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindow, IsWindowVisible, SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+        EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowPos,
+        ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SW_RESTORE,
     };
 
     const WOW_EXE: &str = "Wow.exe";
@@ -33,8 +34,9 @@ mod win_launcher {
     const BOTTOM_MARGIN: i32 = 40;
     const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
     const WAIT_AFTER_LAUNCH: Duration = Duration::from_millis(0);
-    const ENFORCE_DURATION: Duration = Duration::from_secs(60);
     const ENFORCE_INTERVAL: Duration = Duration::from_millis(200);
+    const STABLE_CONFIRMATIONS: u32 = 5;
+    const POSITION_TOLERANCE: i32 = 4;
 
     #[derive(Clone)]
     struct ProcessInfo {
@@ -45,6 +47,7 @@ mod win_launcher {
 
     struct SearchContext {
         pids: HashSet<u32>,
+        class_hints: Vec<String>,
         title_hints: Vec<String>,
         found: Vec<HWND>,
     }
@@ -95,6 +98,15 @@ mod win_launcher {
     fn read_title_hints() -> Vec<String> {
         let raw = std::env::var("WOW_WINDOW_TITLES")
             .unwrap_or_else(|_| "World of Warcraft".to_string());
+        raw.split(',')
+            .map(|part| part.trim().to_lowercase())
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
+    fn read_class_hints() -> Vec<String> {
+        let raw = std::env::var("WOW_WINDOW_CLASSES")
+            .unwrap_or_else(|_| "GxWindowClass".to_string());
         raw.split(',')
             .map(|part| part.trim().to_lowercase())
             .filter(|part| !part.is_empty())
@@ -162,6 +174,18 @@ mod win_launcher {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let mut matched = context.pids.contains(&pid);
 
+        if !matched && !context.class_hints.is_empty() {
+            let mut class_buf = vec![0u16; 256];
+            let copied = GetClassNameW(hwnd, &mut class_buf);
+            if copied > 0 {
+                let class_name = String::from_utf16_lossy(&class_buf[..copied as usize]).to_lowercase();
+                matched = context
+                    .class_hints
+                    .iter()
+                    .any(|hint| class_name == *hint || class_name.contains(hint));
+            }
+        }
+
         if !matched && !context.title_hints.is_empty() {
             let title_len = GetWindowTextLengthW(hwnd);
             if title_len > 0 {
@@ -185,13 +209,14 @@ mod win_launcher {
         BOOL(1)
     }
 
-    fn find_windows(pids: &[u32], title_hints: &[String]) -> Vec<HWND> {
-        if pids.is_empty() && title_hints.is_empty() {
+    fn find_windows(pids: &[u32], class_hints: &[String], title_hints: &[String]) -> Vec<HWND> {
+        if pids.is_empty() && class_hints.is_empty() && title_hints.is_empty() {
             return Vec::new();
         }
 
         let mut context = SearchContext {
             pids: pids.iter().copied().collect(),
+            class_hints: class_hints.to_vec(),
             title_hints: title_hints.to_vec(),
             found: Vec::new(),
         };
@@ -206,6 +231,39 @@ mod win_launcher {
         context.found
     }
 
+    fn target_rect() -> RECT {
+        unsafe {
+            let screen_width = GetSystemMetrics(SM_CXSCREEN);
+            let screen_height = GetSystemMetrics(SM_CYSCREEN);
+            let left = screen_width - TARGET_WIDTH;
+            let top = screen_height - TARGET_HEIGHT - BOTTOM_MARGIN;
+            RECT {
+                left,
+                top,
+                right: left + TARGET_WIDTH,
+                bottom: top + TARGET_HEIGHT,
+            }
+        }
+    }
+
+    fn near_equal(a: i32, b: i32) -> bool {
+        (a - b).abs() <= POSITION_TOLERANCE
+    }
+
+    fn is_window_in_target(hwnd: HWND) -> bool {
+        unsafe {
+            let mut current = RECT::default();
+            if GetWindowRect(hwnd, &mut current).is_err() {
+                return false;
+            }
+            let target = target_rect();
+            near_equal(current.left, target.left)
+                && near_equal(current.top, target.top)
+                && near_equal(current.right, target.right)
+                && near_equal(current.bottom, target.bottom)
+        }
+    }
+
     fn apply_window_layout(hwnd: HWND) -> bool {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
@@ -213,23 +271,40 @@ mod win_launcher {
             }
 
             let _ = ShowWindow(hwnd, SW_RESTORE);
-
-            let screen_width = GetSystemMetrics(SM_CXSCREEN);
-            let screen_height = GetSystemMetrics(SM_CYSCREEN);
-            let pos_x = screen_width - TARGET_WIDTH;
-            let pos_y = screen_height - TARGET_HEIGHT - BOTTOM_MARGIN;
+            let target = target_rect();
+            let width = target.right - target.left;
+            let height = target.bottom - target.top;
 
             SetWindowPos(
                 hwnd,
                 None,
-                pos_x,
-                pos_y,
-                TARGET_WIDTH,
-                TARGET_HEIGHT,
+                target.left,
+                target.top,
+                width,
+                height,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )
             .is_ok()
         }
+    }
+
+    fn ensure_window_layout(hwnd: HWND) -> bool {
+        unsafe {
+            if !IsWindow(hwnd).as_bool() {
+                return false;
+            }
+        }
+
+        if !is_window_in_target(hwnd) {
+            if !apply_window_layout(hwnd) {
+                return false;
+            }
+
+            sleep(Duration::from_millis(50));
+            return is_window_in_target(hwnd);
+        }
+
+        true
     }
 
     pub fn run() {
@@ -251,13 +326,15 @@ mod win_launcher {
         let launched_pid = child.id();
         let start = Instant::now();
         let mut launcher_exit_pid: Option<u32> = None;
+        let class_hints = read_class_hints();
         let title_hints = read_title_hints();
 
         println!(
-            "已启动 WoW，等待窗口并强制固定到右下角小窗... (标题关键字: {:?})",
-            title_hints
+            "已启动 WoW，等待窗口并固定到右下角小窗... (类名关键字: {:?}, 标题关键字: {:?})",
+            class_hints, title_hints
         );
 
+        let mut stable_hits: u32 = 0;
         let first_layout_ok = loop {
             if launcher_exit_pid.is_none() {
                 match child.try_wait() {
@@ -278,16 +355,22 @@ mod win_launcher {
 
             if start.elapsed() >= WAIT_AFTER_LAUNCH {
                 let pids = collect_candidate_pids(launched_pid, launcher_exit_pid, &before_launch);
-                let windows = find_windows(&pids, &title_hints);
+                let windows = find_windows(&pids, &class_hints, &title_hints);
 
-                let mut moved = false;
+                let mut any_stable = false;
                 for hwnd in windows {
-                    if apply_window_layout(hwnd) {
-                        moved = true;
+                    if ensure_window_layout(hwnd) {
+                        any_stable = true;
                     }
                 }
 
-                if moved {
+                if any_stable {
+                    stable_hits += 1;
+                } else {
+                    stable_hits = 0;
+                }
+
+                if stable_hits >= STABLE_CONFIRMATIONS {
                     break true;
                 }
             }
@@ -304,18 +387,8 @@ mod win_launcher {
             std::process::exit(1);
         }
 
-        let enforce_start = Instant::now();
-        while enforce_start.elapsed() < ENFORCE_DURATION {
-            let pids = collect_candidate_pids(launched_pid, launcher_exit_pid, &before_launch);
-            let windows = find_windows(&pids, &title_hints);
-            for hwnd in windows {
-                let _ = apply_window_layout(hwnd);
-            }
-            sleep(ENFORCE_INTERVAL);
-        }
-
         println!(
-            "已将 WoW 固定为右下角小窗（{}x{}）",
+            "已将 WoW 固定为右下角小窗（{}x{}），启动器自动退出",
             TARGET_WIDTH,
             TARGET_HEIGHT
         );
