@@ -1,0 +1,18 @@
+wow_exe = "Wow.exe"
+wow_args = ["-windowed"]
+
+# 窗口类名关键字（不区分大小写）
+class_hints = ["GxWindowClass"]
+
+# 窗口标题关键字（不区分大小写）
+title_hints = ["World of Warcraft"]
+
+target_width = 500
+target_height = 500
+bottom_margin = 40
+
+wait_timeout_ms = 60000
+wait_after_launch_ms = 0
+enforce_interval_ms = 200
+stable_confirmations = 5
+position_tolerance = 4

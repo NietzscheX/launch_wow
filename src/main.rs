@@ -1,8 +1,10 @@
 #[cfg(target_os = "windows")]
 mod win_launcher {
+    use serde::{Deserialize, Serialize};
     use std::collections::HashSet;
+    use std::fs;
     use std::mem::size_of;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -19,8 +21,9 @@ mod win_launcher {
         SW_RESTORE,
     };
 
-    const WOW_EXE: &str = "Wow.exe";
-    const WOW_ARGS: &[&str] = &["-windowed"];
+    const CONFIG_FILE_NAME: &str = "launch_wow.toml";
+    const DEFAULT_WOW_EXE: &str = "Wow.exe";
+    const DEFAULT_WOW_ARGS: &[&str] = &["-windowed"];
     const WOW_PROCESS_NAMES: &[&str] = &[
         "wow.exe",
         "wow-64.exe",
@@ -29,20 +32,74 @@ mod win_launcher {
         "wowclasst.exe",
         "wowb.exe",
     ];
-    const TARGET_WIDTH: i32 = 500;
-    const TARGET_HEIGHT: i32 = 500;
-    const BOTTOM_MARGIN: i32 = 40;
-    const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-    const WAIT_AFTER_LAUNCH: Duration = Duration::from_millis(0);
-    const ENFORCE_INTERVAL: Duration = Duration::from_millis(200);
-    const STABLE_CONFIRMATIONS: u32 = 5;
-    const POSITION_TOLERANCE: i32 = 4;
+    const DEFAULT_TITLE_HINTS: &[&str] = &["World of Warcraft"];
+    const DEFAULT_CLASS_HINTS: &[&str] = &["GxWindowClass"];
+    const DEFAULT_TARGET_WIDTH: i32 = 500;
+    const DEFAULT_TARGET_HEIGHT: i32 = 500;
+    const DEFAULT_BOTTOM_MARGIN: i32 = 40;
+    const DEFAULT_WAIT_TIMEOUT_MS: u64 = 60_000;
+    const DEFAULT_WAIT_AFTER_LAUNCH_MS: u64 = 0;
+    const DEFAULT_ENFORCE_INTERVAL_MS: u64 = 200;
+    const DEFAULT_STABLE_CONFIRMATIONS: u32 = 5;
+    const DEFAULT_POSITION_TOLERANCE: i32 = 4;
 
     #[derive(Clone)]
     struct ProcessInfo {
         pid: u32,
         parent_pid: u32,
         exe_name: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(default)]
+    struct TomlConfig {
+        wow_exe: String,
+        wow_args: Vec<String>,
+        class_hints: Vec<String>,
+        title_hints: Vec<String>,
+        target_width: i32,
+        target_height: i32,
+        bottom_margin: i32,
+        wait_timeout_ms: u64,
+        wait_after_launch_ms: u64,
+        enforce_interval_ms: u64,
+        stable_confirmations: u32,
+        position_tolerance: i32,
+    }
+
+    impl Default for TomlConfig {
+        fn default() -> Self {
+            Self {
+                wow_exe: DEFAULT_WOW_EXE.to_string(),
+                wow_args: DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect(),
+                class_hints: DEFAULT_CLASS_HINTS.iter().map(|hint| (*hint).to_string()).collect(),
+                title_hints: DEFAULT_TITLE_HINTS.iter().map(|hint| (*hint).to_string()).collect(),
+                target_width: DEFAULT_TARGET_WIDTH,
+                target_height: DEFAULT_TARGET_HEIGHT,
+                bottom_margin: DEFAULT_BOTTOM_MARGIN,
+                wait_timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                wait_after_launch_ms: DEFAULT_WAIT_AFTER_LAUNCH_MS,
+                enforce_interval_ms: DEFAULT_ENFORCE_INTERVAL_MS,
+                stable_confirmations: DEFAULT_STABLE_CONFIRMATIONS,
+                position_tolerance: DEFAULT_POSITION_TOLERANCE,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Config {
+        wow_exe: String,
+        wow_args: Vec<String>,
+        class_hints: Vec<String>,
+        title_hints: Vec<String>,
+        target_width: i32,
+        target_height: i32,
+        bottom_margin: i32,
+        wait_timeout: Duration,
+        wait_after_launch: Duration,
+        enforce_interval: Duration,
+        stable_confirmations: u32,
+        position_tolerance: i32,
     }
 
     struct SearchContext {
@@ -95,22 +152,163 @@ mod win_launcher {
         }
     }
 
-    fn read_title_hints() -> Vec<String> {
-        let raw = std::env::var("WOW_WINDOW_TITLES")
-            .unwrap_or_else(|_| "World of Warcraft".to_string());
-        raw.split(',')
+    fn normalize_hints(mut raw: Vec<String>, defaults: &[&str]) -> Vec<String> {
+        raw.retain(|part| !part.trim().is_empty());
+        let mut normalized: Vec<String> = raw
+            .into_iter()
             .map(|part| part.trim().to_lowercase())
             .filter(|part| !part.is_empty())
             .collect()
+        ;
+        if normalized.is_empty() {
+            normalized = defaults.iter().map(|hint| hint.to_lowercase()).collect();
+        }
+        normalized
     }
 
-    fn read_class_hints() -> Vec<String> {
-        let raw = std::env::var("WOW_WINDOW_CLASSES")
-            .unwrap_or_else(|_| "GxWindowClass".to_string());
-        raw.split(',')
-            .map(|part| part.trim().to_lowercase())
-            .filter(|part| !part.is_empty())
-            .collect()
+    fn resolve_config_path() -> PathBuf {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                return dir.join(CONFIG_FILE_NAME);
+            }
+        }
+        PathBuf::from(CONFIG_FILE_NAME)
+    }
+
+    fn resolve_wow_exe_path(wow_exe: &str, config_path: &Path) -> PathBuf {
+        let candidate = Path::new(wow_exe);
+        if candidate.is_absolute() {
+            return candidate.to_path_buf();
+        }
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(candidate)
+    }
+
+    fn default_config_template() -> String {
+        format!(
+            "# launch_wow.toml\n\
+             # 如果 wow_exe 不是绝对路径，会按“配置文件所在目录”解析。\n\
+             wow_exe = \"{}\"\n\
+             \n\
+             # 启动参数，默认保持窗口模式。\n\
+             wow_args = [\"{}\"]\n\
+             \n\
+             # 窗口类名关键字（不区分大小写）。\n\
+             # 常见值: GxWindowClass\n\
+             class_hints = [\"{}\"]\n\
+             \n\
+             # 窗口标题关键字（不区分大小写）。\n\
+             # 默认: World of Warcraft\n\
+             title_hints = [\"{}\"]\n\
+             \n\
+             # 目标窗口大小（像素）。\n\
+             target_width = {}\n\
+             target_height = {}\n\
+             \n\
+             # 距离屏幕底边的额外边距（用于避开任务栏）。\n\
+             bottom_margin = {}\n\
+             \n\
+             # 等待超时（毫秒）。超时后启动器退出并报错。\n\
+             wait_timeout_ms = {}\n\
+             \n\
+             # 启动后延迟多少毫秒再开始窗口修正。\n\
+             wait_after_launch_ms = {}\n\
+             \n\
+             # 修正窗口的轮询间隔（毫秒）。\n\
+             enforce_interval_ms = {}\n\
+             \n\
+             # 连续命中多少次“已在目标位置尺寸”后，视为完成并自动退出。\n\
+             stable_confirmations = {}\n\
+             \n\
+             # 坐标/尺寸允许误差（像素），用于应对 DPI 或边框差异。\n\
+             position_tolerance = {}\n",
+            DEFAULT_WOW_EXE,
+            DEFAULT_WOW_ARGS[0],
+            DEFAULT_CLASS_HINTS[0],
+            DEFAULT_TITLE_HINTS[0],
+            DEFAULT_TARGET_WIDTH,
+            DEFAULT_TARGET_HEIGHT,
+            DEFAULT_BOTTOM_MARGIN,
+            DEFAULT_WAIT_TIMEOUT_MS,
+            DEFAULT_WAIT_AFTER_LAUNCH_MS,
+            DEFAULT_ENFORCE_INTERVAL_MS,
+            DEFAULT_STABLE_CONFIRMATIONS,
+            DEFAULT_POSITION_TOLERANCE
+        )
+    }
+
+    fn load_config() -> Result<(Config, PathBuf), String> {
+        let config_path = resolve_config_path();
+
+        if !config_path.exists() {
+            let default_content = default_config_template();
+            fs::write(&config_path, default_content)
+                .map_err(|err| format!("写入默认配置失败 ({}): {}", config_path.display(), err))?;
+            println!("未找到配置文件，已生成默认配置: {}", config_path.display());
+        }
+
+        let config_text = fs::read_to_string(&config_path)
+            .map_err(|err| format!("读取配置文件失败 ({}): {}", config_path.display(), err))?;
+        let file_config: TomlConfig = toml::from_str(&config_text)
+            .map_err(|err| format!("解析 TOML 配置失败 ({}): {}", config_path.display(), err))?;
+
+        let wow_exe = if file_config.wow_exe.trim().is_empty() {
+            DEFAULT_WOW_EXE.to_string()
+        } else {
+            file_config.wow_exe.trim().to_string()
+        };
+        let wow_args: Vec<String> = if file_config.wow_args.is_empty() {
+            DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect()
+        } else {
+            file_config
+                .wow_args
+                .iter()
+                .map(|arg| arg.trim().to_string())
+                .filter(|arg| !arg.is_empty())
+                .collect()
+        };
+
+        let config = Config {
+            wow_exe,
+            wow_args: if wow_args.is_empty() {
+                DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect()
+            } else {
+                wow_args
+            },
+            class_hints: normalize_hints(file_config.class_hints, DEFAULT_CLASS_HINTS),
+            title_hints: normalize_hints(file_config.title_hints, DEFAULT_TITLE_HINTS),
+            target_width: file_config.target_width,
+            target_height: file_config.target_height,
+            bottom_margin: file_config.bottom_margin,
+            wait_timeout: Duration::from_millis(file_config.wait_timeout_ms),
+            wait_after_launch: Duration::from_millis(file_config.wait_after_launch_ms),
+            enforce_interval: Duration::from_millis(file_config.enforce_interval_ms),
+            stable_confirmations: file_config.stable_confirmations,
+            position_tolerance: file_config.position_tolerance,
+        };
+
+        if config.target_width <= 0 {
+            return Err("-- target_width 必须大于 0".to_string());
+        }
+        if config.target_height <= 0 {
+            return Err("-- target_height 必须大于 0".to_string());
+        }
+        if config.stable_confirmations == 0 {
+            return Err("-- stable_confirmations 必须大于 0".to_string());
+        }
+        if config.position_tolerance < 0 {
+            return Err("-- position_tolerance 不能小于 0".to_string());
+        }
+        if config.enforce_interval == Duration::from_millis(0) {
+            return Err("-- enforce_interval_ms 不能为 0".to_string());
+        }
+        if config.wait_timeout == Duration::from_millis(0) {
+            return Err("-- wait_timeout_ms 不能为 0".to_string());
+        }
+
+        Ok((config, config_path))
     }
 
     fn process_exists(pid: u32) -> bool {
@@ -231,47 +429,47 @@ mod win_launcher {
         context.found
     }
 
-    fn target_rect() -> RECT {
+    fn target_rect(config: &Config) -> RECT {
         unsafe {
             let screen_width = GetSystemMetrics(SM_CXSCREEN);
             let screen_height = GetSystemMetrics(SM_CYSCREEN);
-            let left = screen_width - TARGET_WIDTH;
-            let top = screen_height - TARGET_HEIGHT - BOTTOM_MARGIN;
+            let left = screen_width - config.target_width;
+            let top = screen_height - config.target_height - config.bottom_margin;
             RECT {
                 left,
                 top,
-                right: left + TARGET_WIDTH,
-                bottom: top + TARGET_HEIGHT,
+                right: left + config.target_width,
+                bottom: top + config.target_height,
             }
         }
     }
 
-    fn near_equal(a: i32, b: i32) -> bool {
-        (a - b).abs() <= POSITION_TOLERANCE
+    fn near_equal(a: i32, b: i32, tolerance: i32) -> bool {
+        (a - b).abs() <= tolerance
     }
 
-    fn is_window_in_target(hwnd: HWND) -> bool {
+    fn is_window_in_target(hwnd: HWND, config: &Config) -> bool {
         unsafe {
             let mut current = RECT::default();
             if GetWindowRect(hwnd, &mut current).is_err() {
                 return false;
             }
-            let target = target_rect();
-            near_equal(current.left, target.left)
-                && near_equal(current.top, target.top)
-                && near_equal(current.right, target.right)
-                && near_equal(current.bottom, target.bottom)
+            let target = target_rect(config);
+            near_equal(current.left, target.left, config.position_tolerance)
+                && near_equal(current.top, target.top, config.position_tolerance)
+                && near_equal(current.right, target.right, config.position_tolerance)
+                && near_equal(current.bottom, target.bottom, config.position_tolerance)
         }
     }
 
-    fn apply_window_layout(hwnd: HWND) -> bool {
+    fn apply_window_layout(hwnd: HWND, config: &Config) -> bool {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
                 return false;
             }
 
             let _ = ShowWindow(hwnd, SW_RESTORE);
-            let target = target_rect();
+            let target = target_rect(config);
             let width = target.right - target.left;
             let height = target.bottom - target.top;
 
@@ -288,37 +486,50 @@ mod win_launcher {
         }
     }
 
-    fn ensure_window_layout(hwnd: HWND) -> bool {
+    fn ensure_window_layout(hwnd: HWND, config: &Config) -> bool {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
                 return false;
             }
         }
 
-        if !is_window_in_target(hwnd) {
-            if !apply_window_layout(hwnd) {
+        if !is_window_in_target(hwnd, config) {
+            if !apply_window_layout(hwnd, config) {
                 return false;
             }
 
             sleep(Duration::from_millis(50));
-            return is_window_in_target(hwnd);
+            return is_window_in_target(hwnd, config);
         }
 
         true
     }
 
     pub fn run() {
-        if !Path::new(WOW_EXE).exists() {
-            eprintln!("未找到 {}，请把启动器和 wow.exe 放在同一目录", WOW_EXE);
+        let (config, config_path) = match load_config() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(2);
+            }
+        };
+        let wow_exe_path = resolve_wow_exe_path(&config.wow_exe, &config_path);
+
+        if !wow_exe_path.exists() {
+            eprintln!(
+                "未找到 {} (来自配置文件 {})",
+                wow_exe_path.display(),
+                config_path.display()
+            );
             std::process::exit(1);
         }
 
         let before_launch: HashSet<u32> = collect_processes().into_iter().map(|p| p.pid).collect();
 
-        let mut child = match Command::new(WOW_EXE).args(WOW_ARGS).spawn() {
+        let mut child = match Command::new(&wow_exe_path).args(&config.wow_args).spawn() {
             Ok(child) => child,
             Err(err) => {
-                eprintln!("启动 {} 失败: {}", WOW_EXE, err);
+                eprintln!("启动 {} 失败: {}", wow_exe_path.display(), err);
                 std::process::exit(1);
             }
         };
@@ -326,12 +537,10 @@ mod win_launcher {
         let launched_pid = child.id();
         let start = Instant::now();
         let mut launcher_exit_pid: Option<u32> = None;
-        let class_hints = read_class_hints();
-        let title_hints = read_title_hints();
 
         println!(
             "已启动 WoW，等待窗口并固定到右下角小窗... (类名关键字: {:?}, 标题关键字: {:?})",
-            class_hints, title_hints
+            config.class_hints, config.title_hints
         );
 
         let mut stable_hits: u32 = 0;
@@ -353,13 +562,13 @@ mod win_launcher {
                 }
             }
 
-            if start.elapsed() >= WAIT_AFTER_LAUNCH {
+            if start.elapsed() >= config.wait_after_launch {
                 let pids = collect_candidate_pids(launched_pid, launcher_exit_pid, &before_launch);
-                let windows = find_windows(&pids, &class_hints, &title_hints);
+                let windows = find_windows(&pids, &config.class_hints, &config.title_hints);
 
                 let mut any_stable = false;
                 for hwnd in windows {
-                    if ensure_window_layout(hwnd) {
+                    if ensure_window_layout(hwnd, &config) {
                         any_stable = true;
                     }
                 }
@@ -370,16 +579,16 @@ mod win_launcher {
                     stable_hits = 0;
                 }
 
-                if stable_hits >= STABLE_CONFIRMATIONS {
+                if stable_hits >= config.stable_confirmations {
                     break true;
                 }
             }
 
-            if start.elapsed() > WAIT_TIMEOUT {
+            if start.elapsed() > config.wait_timeout {
                 break false;
             }
 
-            sleep(ENFORCE_INTERVAL);
+            sleep(config.enforce_interval);
         };
 
         if !first_layout_ok {
@@ -389,8 +598,7 @@ mod win_launcher {
 
         println!(
             "已将 WoW 固定为右下角小窗（{}x{}），启动器自动退出",
-            TARGET_WIDTH,
-            TARGET_HEIGHT
+            config.target_width, config.target_height
         );
     }
 }
