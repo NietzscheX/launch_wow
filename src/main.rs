@@ -21,8 +21,9 @@ mod win_launcher {
         PROCESS_VM_WRITE,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_RETURN, VK_TAB,
+        MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+        VK_RETURN, VK_TAB,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
@@ -1302,20 +1303,38 @@ mod win_launcher {
         wparam: usize,
         lparam: isize,
     ) -> Result<(), String> {
-        let posted = unsafe { PostMessageW(hwnd, msg, WPARAM(wparam), LPARAM(lparam)) };
-        if posted.as_bool() {
-            Ok(())
-        } else {
-            Err(format!(
-                "向窗口 {:?} 投递消息失败 (msg=0x{:X}, wparam=0x{:X})",
-                hwnd, msg, wparam
-            ))
+        unsafe { PostMessageW(hwnd, msg, WPARAM(wparam), LPARAM(lparam)) }.map_err(|err| {
+            format!(
+                "向窗口 {:?} 投递消息失败 (msg=0x{:X}, wparam=0x{:X}): {}",
+                hwnd, msg, wparam, err
+            )
+        })?;
+        Ok(())
+    }
+
+    fn make_key_message_lparam(vk: VIRTUAL_KEY, key_up: bool) -> isize {
+        let scan_code = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as isize;
+        let mut lparam = 1isize | (scan_code << 16);
+        if key_up {
+            lparam |= 1isize << 30;
+            lparam |= 1isize << 31;
         }
+        lparam
     }
 
     fn post_virtual_key_to_window(hwnd: HWND, vk: VIRTUAL_KEY) -> Result<(), String> {
-        post_window_message(hwnd, WM_KEYDOWN, vk.0 as usize, 0)?;
-        post_window_message(hwnd, WM_KEYUP, vk.0 as usize, 0)?;
+        post_window_message(
+            hwnd,
+            WM_KEYDOWN,
+            vk.0 as usize,
+            make_key_message_lparam(vk, false),
+        )?;
+        post_window_message(
+            hwnd,
+            WM_KEYUP,
+            vk.0 as usize,
+            make_key_message_lparam(vk, true),
+        )?;
         Ok(())
     }
 
@@ -1325,7 +1344,7 @@ mod win_launcher {
         key_delay: Duration,
     ) -> Result<(), String> {
         for ch in text.encode_utf16() {
-            post_window_message(hwnd, WM_CHAR, ch as usize, 0)?;
+            post_window_message(hwnd, WM_CHAR, ch as usize, 1)?;
             if key_delay > Duration::from_millis(0) {
                 sleep(key_delay);
             }
