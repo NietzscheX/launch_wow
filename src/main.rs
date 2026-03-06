@@ -1,6 +1,6 @@
 #[cfg(target_os = "windows")]
 mod win_launcher {
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use std::collections::HashSet;
     use std::fs;
     use std::mem::size_of;
@@ -21,10 +21,12 @@ mod win_launcher {
         SW_RESTORE,
     };
 
-    const CONFIG_FILE_NAME: &str = "launch_wow.toml";
-    const DEFAULT_WOW_EXE: &str = "Wow.exe";
-    const DEFAULT_WOW_ARGS: &[&str] = &["-windowed"];
-    const WOW_PROCESS_NAMES: &[&str] = &[
+    const CONFIG_FILE_NAMES: &[&str] = &["launch_apps.toml", "launch_wow.toml"];
+    const CONFIG_ENV_VARS: &[&str] = &["LAUNCH_APPS_CONFIG", "LAUNCH_WOW_CONFIG"];
+
+    const LEGACY_DEFAULT_EXE: &str = "Wow.exe";
+    const LEGACY_DEFAULT_ARGS: &[&str] = &["-windowed"];
+    const LEGACY_DEFAULT_PROCESS_NAMES: &[&str] = &[
         "wow.exe",
         "wow-64.exe",
         "wowclassic.exe",
@@ -32,8 +34,11 @@ mod win_launcher {
         "wowclasst.exe",
         "wowb.exe",
     ];
-    const DEFAULT_TITLE_HINTS: &[&str] = &["World of Warcraft"];
-    const DEFAULT_CLASS_HINTS: &[&str] = &["GxWindowClass"];
+    const LEGACY_DEFAULT_TITLE_HINTS: &[&str] = &["World of Warcraft"];
+    const LEGACY_DEFAULT_CLASS_HINTS: &[&str] = &["GxWindowClass"];
+
+    const DEFAULT_TARGET_X: i32 = 100;
+    const DEFAULT_TARGET_Y: i32 = 100;
     const DEFAULT_TARGET_WIDTH: i32 = 500;
     const DEFAULT_TARGET_HEIGHT: i32 = 500;
     const DEFAULT_BOTTOM_MARGIN: i32 = 40;
@@ -50,16 +55,71 @@ mod win_launcher {
         exe_name: String,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Deserialize)]
     #[serde(default)]
     struct TomlConfig {
-        wow_exe: String,
-        wow_args: Vec<String>,
-        class_hints: Vec<String>,
-        title_hints: Vec<String>,
-        target_width: i32,
-        target_height: i32,
-        bottom_margin: i32,
+        defaults: TomlDefaults,
+        apps: Vec<TomlAppConfig>,
+
+        // 旧版单程序配置兼容字段。
+        wow_exe: Option<String>,
+        wow_args: Option<Vec<String>>,
+        process_names: Option<Vec<String>>,
+        class_hints: Option<Vec<String>>,
+        title_hints: Option<Vec<String>>,
+        target_width: Option<i32>,
+        target_height: Option<i32>,
+        bottom_margin: Option<i32>,
+        wait_timeout_ms: Option<u64>,
+        wait_after_launch_ms: Option<u64>,
+        enforce_interval_ms: Option<u64>,
+        stable_confirmations: Option<u32>,
+        position_tolerance: Option<i32>,
+    }
+
+    impl Default for TomlConfig {
+        fn default() -> Self {
+            Self {
+                defaults: TomlDefaults::default(),
+                apps: Vec::new(),
+                wow_exe: None,
+                wow_args: None,
+                process_names: None,
+                class_hints: None,
+                title_hints: None,
+                target_width: None,
+                target_height: None,
+                bottom_margin: None,
+                wait_timeout_ms: None,
+                wait_after_launch_ms: None,
+                enforce_interval_ms: None,
+                stable_confirmations: None,
+                position_tolerance: None,
+            }
+        }
+    }
+
+    impl TomlConfig {
+        fn has_legacy_fields(&self) -> bool {
+            self.wow_exe.is_some()
+                || self.wow_args.is_some()
+                || self.process_names.is_some()
+                || self.class_hints.is_some()
+                || self.title_hints.is_some()
+                || self.target_width.is_some()
+                || self.target_height.is_some()
+                || self.bottom_margin.is_some()
+                || self.wait_timeout_ms.is_some()
+                || self.wait_after_launch_ms.is_some()
+                || self.enforce_interval_ms.is_some()
+                || self.stable_confirmations.is_some()
+                || self.position_tolerance.is_some()
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    struct TomlDefaults {
         wait_timeout_ms: u64,
         wait_after_launch_ms: u64,
         enforce_interval_ms: u64,
@@ -67,16 +127,9 @@ mod win_launcher {
         position_tolerance: i32,
     }
 
-    impl Default for TomlConfig {
+    impl Default for TomlDefaults {
         fn default() -> Self {
             Self {
-                wow_exe: DEFAULT_WOW_EXE.to_string(),
-                wow_args: DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect(),
-                class_hints: DEFAULT_CLASS_HINTS.iter().map(|hint| (*hint).to_string()).collect(),
-                title_hints: DEFAULT_TITLE_HINTS.iter().map(|hint| (*hint).to_string()).collect(),
-                target_width: DEFAULT_TARGET_WIDTH,
-                target_height: DEFAULT_TARGET_HEIGHT,
-                bottom_margin: DEFAULT_BOTTOM_MARGIN,
                 wait_timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
                 wait_after_launch_ms: DEFAULT_WAIT_AFTER_LAUNCH_MS,
                 enforce_interval_ms: DEFAULT_ENFORCE_INTERVAL_MS,
@@ -86,20 +139,84 @@ mod win_launcher {
         }
     }
 
-    #[derive(Clone)]
-    struct Config {
-        wow_exe: String,
-        wow_args: Vec<String>,
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    struct TomlAppConfig {
+        enabled: bool,
+        name: String,
+        exe: String,
+        args: Vec<String>,
+        process_names: Vec<String>,
         class_hints: Vec<String>,
         title_hints: Vec<String>,
-        target_width: i32,
-        target_height: i32,
-        bottom_margin: i32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        wait_timeout_ms: Option<u64>,
+        wait_after_launch_ms: Option<u64>,
+        enforce_interval_ms: Option<u64>,
+        stable_confirmations: Option<u32>,
+        position_tolerance: Option<i32>,
+    }
+
+    impl Default for TomlAppConfig {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                name: String::new(),
+                exe: String::new(),
+                args: Vec::new(),
+                process_names: Vec::new(),
+                class_hints: Vec::new(),
+                title_hints: Vec::new(),
+                x: DEFAULT_TARGET_X,
+                y: DEFAULT_TARGET_Y,
+                width: DEFAULT_TARGET_WIDTH,
+                height: DEFAULT_TARGET_HEIGHT,
+                wait_timeout_ms: None,
+                wait_after_launch_ms: None,
+                enforce_interval_ms: None,
+                stable_confirmations: None,
+                position_tolerance: None,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct LaunchConfig {
+        apps: Vec<AppConfig>,
+    }
+
+    #[derive(Clone)]
+    struct AppConfig {
+        name: String,
+        exe: String,
+        args: Vec<String>,
+        process_names: Vec<String>,
+        class_hints: Vec<String>,
+        title_hints: Vec<String>,
+        placement: WindowPlacement,
         wait_timeout: Duration,
         wait_after_launch: Duration,
         enforce_interval: Duration,
         stable_confirmations: u32,
         position_tolerance: i32,
+    }
+
+    #[derive(Clone)]
+    enum WindowPlacement {
+        Absolute {
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        },
+        BottomRight {
+            width: i32,
+            height: i32,
+            bottom_margin: i32,
+        },
     }
 
     struct SearchContext {
@@ -131,7 +248,7 @@ mod win_launcher {
                     processes.push(ProcessInfo {
                         pid: entry.th32ProcessID,
                         parent_pid: entry.th32ParentProcessID,
-                        exe_name: wide_to_string(&entry.szExeFile),
+                        exe_name: wide_to_string(&entry.szExeFile).to_lowercase(),
                     });
 
                     if Process32NextW(snapshot, &mut entry).is_err() {
@@ -152,18 +269,93 @@ mod win_launcher {
         }
     }
 
-    fn normalize_hints(mut raw: Vec<String>, defaults: &[&str]) -> Vec<String> {
-        raw.retain(|part| !part.trim().is_empty());
+    fn trim_args(raw: Vec<String>) -> Vec<String> {
+        raw.into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
+    fn normalize_matchers(raw: Vec<String>) -> Vec<String> {
         let mut normalized: Vec<String> = raw
             .into_iter()
             .map(|part| part.trim().to_lowercase())
             .filter(|part| !part.is_empty())
-            .collect()
-        ;
-        if normalized.is_empty() {
-            normalized = defaults.iter().map(|hint| hint.to_lowercase()).collect();
-        }
+            .collect();
+        normalized.sort_unstable();
+        normalized.dedup();
         normalized
+    }
+
+    fn normalize_matchers_with_defaults(raw: Vec<String>, defaults: &[&str]) -> Vec<String> {
+        let normalized = normalize_matchers(raw);
+        if normalized.is_empty() {
+            defaults.iter().map(|part| part.to_lowercase()).collect()
+        } else {
+            normalized
+        }
+    }
+
+    fn canonical_process_name(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let file_name = Path::new(trimmed)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(trimmed);
+        let lower = file_name.trim().to_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+
+        if lower.ends_with(".exe") {
+            Some(lower)
+        } else {
+            Some(format!("{}.exe", lower))
+        }
+    }
+
+    fn default_process_names_for_exe(exe: &str) -> Vec<String> {
+        canonical_process_name(exe).into_iter().collect()
+    }
+
+    fn normalize_process_names(raw: Vec<String>, exe: &str, defaults: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = raw
+            .into_iter()
+            .filter_map(|part| canonical_process_name(&part))
+            .collect();
+
+        if names.is_empty() {
+            names = defaults
+                .iter()
+                .filter_map(|part| canonical_process_name(part))
+                .collect();
+        }
+
+        if names.is_empty() {
+            names = default_process_names_for_exe(exe);
+        }
+
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    fn infer_app_name(preferred: &str, exe: &str) -> String {
+        let trimmed = preferred.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+
+        Path::new(exe)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("app")
+            .to_string()
     }
 
     fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -181,30 +373,60 @@ mod win_launcher {
     fn config_candidates() -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
-        // 1) 可选：显式路径覆盖
-        if let Ok(raw) = std::env::var("LAUNCH_WOW_CONFIG") {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                candidates.push(PathBuf::from(trimmed));
+        for env_name in CONFIG_ENV_VARS {
+            if let Ok(raw) = std::env::var(env_name) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    candidates.push(PathBuf::from(trimmed));
+                }
             }
         }
 
-        // 2) exe 同目录（双击运行时最符合预期）
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
-                candidates.push(dir.join(CONFIG_FILE_NAME));
+                for file_name in CONFIG_FILE_NAMES {
+                    candidates.push(dir.join(file_name));
+                }
             }
         }
 
-        // 3) 当前工作目录
         if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join(CONFIG_FILE_NAME));
+            for file_name in CONFIG_FILE_NAMES {
+                candidates.push(cwd.join(file_name));
+            }
         }
 
-        // 4) 最后兜底：相对路径
-        candidates.push(PathBuf::from(CONFIG_FILE_NAME));
+        for file_name in CONFIG_FILE_NAMES {
+            candidates.push(PathBuf::from(file_name));
+        }
 
         dedup_paths(candidates)
+    }
+
+    fn default_config_targets() -> Vec<PathBuf> {
+        let mut targets = Vec::new();
+
+        for env_name in CONFIG_ENV_VARS {
+            if let Ok(raw) = std::env::var(env_name) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    targets.push(PathBuf::from(trimmed));
+                }
+            }
+        }
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                targets.push(dir.join(CONFIG_FILE_NAMES[0]));
+            }
+        }
+
+        if let Ok(cwd) = std::env::current_dir() {
+            targets.push(cwd.join(CONFIG_FILE_NAMES[0]));
+        }
+
+        targets.push(PathBuf::from(CONFIG_FILE_NAMES[0]));
+        dedup_paths(targets)
     }
 
     fn find_existing_config() -> Option<PathBuf> {
@@ -213,14 +435,16 @@ mod win_launcher {
 
     fn create_default_config() -> Result<PathBuf, String> {
         let default_content = default_config_template();
-        let targets = config_candidates();
+        let targets = default_config_targets();
         let mut errors = Vec::new();
 
         for target in targets {
             if let Some(parent) = target.parent() {
-                if let Err(err) = fs::create_dir_all(parent) {
-                    errors.push(format!("创建目录失败 {}: {}", parent.display(), err));
-                    continue;
+                if !parent.as_os_str().is_empty() {
+                    if let Err(err) = fs::create_dir_all(parent) {
+                        errors.push(format!("创建目录失败 {}: {}", parent.display(), err));
+                        continue;
+                    }
                 }
             }
 
@@ -231,16 +455,18 @@ mod win_launcher {
         }
 
         Err(format!(
-            "无法自动创建配置文件 launch_wow.toml。尝试结果:\n{}",
+            "无法自动创建配置文件 {}。尝试结果:\n{}",
+            CONFIG_FILE_NAMES[0],
             errors.join("\n")
         ))
     }
 
-    fn resolve_wow_exe_path(wow_exe: &str, config_path: &Path) -> PathBuf {
-        let candidate = Path::new(wow_exe);
+    fn resolve_exe_path(exe: &str, config_path: &Path) -> PathBuf {
+        let candidate = Path::new(exe);
         if candidate.is_absolute() {
             return candidate.to_path_buf();
         }
+
         config_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -248,90 +474,221 @@ mod win_launcher {
     }
 
     fn default_config_template() -> String {
+        let process_names = LEGACY_DEFAULT_PROCESS_NAMES
+            .iter()
+            .map(|name| format!("\"{}\"", name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         format!(
-            "# launch_wow.toml\n\
-             # 如果 wow_exe 不是绝对路径，会按“配置文件所在目录”解析。\n\
-             wow_exe = \"{}\"\n\
+            "# launch_apps.toml\n\
+             # 相对路径会按“配置文件所在目录”解析。\n\
+             # 多个 [[apps]] 会按顺序依次启动，并把窗口固定到指定位置和大小。\n\
              \n\
-             # 启动参数，默认保持窗口模式。\n\
-             wow_args = [\"{}\"]\n\
-             \n\
-             # 窗口类名关键字（不区分大小写）。\n\
-             # 常见值: GxWindowClass\n\
-             class_hints = [\"{}\"]\n\
-             \n\
-             # 窗口标题关键字（不区分大小写）。\n\
-             # 默认: World of Warcraft\n\
-             title_hints = [\"{}\"]\n\
-             \n\
-             # 目标窗口大小（像素）。\n\
-             target_width = {}\n\
-             target_height = {}\n\
-             \n\
-             # 距离屏幕底边的额外边距（用于避开任务栏）。\n\
-             bottom_margin = {}\n\
-             \n\
-             # 等待超时（毫秒）。超时后启动器退出并报错。\n\
+             [defaults]\n\
              wait_timeout_ms = {}\n\
-             \n\
-             # 启动后延迟多少毫秒再开始窗口修正。\n\
              wait_after_launch_ms = {}\n\
-             \n\
-             # 修正窗口的轮询间隔（毫秒）。\n\
              enforce_interval_ms = {}\n\
-             \n\
-             # 连续命中多少次“已在目标位置尺寸”后，视为完成并自动退出。\n\
              stable_confirmations = {}\n\
+             position_tolerance = {}\n\
              \n\
-             # 坐标/尺寸允许误差（像素），用于应对 DPI 或边框差异。\n\
-             position_tolerance = {}\n",
-            DEFAULT_WOW_EXE,
-            DEFAULT_WOW_ARGS[0],
-            DEFAULT_CLASS_HINTS[0],
-            DEFAULT_TITLE_HINTS[0],
-            DEFAULT_TARGET_WIDTH,
-            DEFAULT_TARGET_HEIGHT,
-            DEFAULT_BOTTOM_MARGIN,
+             [[apps]]\n\
+             name = \"wow\"\n\
+             exe = \"{}\"\n\
+             args = [\"{}\"]\n\
+             process_names = [{}]\n\
+             class_hints = [\"{}\"]\n\
+             title_hints = [\"{}\"]\n\
+             x = {}\n\
+             y = {}\n\
+             width = {}\n\
+             height = {}\n\
+             \n\
+             [[apps]]\n\
+             enabled = false\n\
+             name = \"notepad\"\n\
+             exe = \"C:\\\\Windows\\\\System32\\\\notepad.exe\"\n\
+             title_hints = [\"notepad\", \"记事本\"]\n\
+             x = 650\n\
+             y = 100\n\
+             width = 900\n\
+             height = 700\n",
             DEFAULT_WAIT_TIMEOUT_MS,
             DEFAULT_WAIT_AFTER_LAUNCH_MS,
             DEFAULT_ENFORCE_INTERVAL_MS,
             DEFAULT_STABLE_CONFIRMATIONS,
-            DEFAULT_POSITION_TOLERANCE
+            DEFAULT_POSITION_TOLERANCE,
+            LEGACY_DEFAULT_EXE,
+            LEGACY_DEFAULT_ARGS[0],
+            process_names,
+            LEGACY_DEFAULT_CLASS_HINTS[0],
+            LEGACY_DEFAULT_TITLE_HINTS[0],
+            DEFAULT_TARGET_X,
+            DEFAULT_TARGET_Y,
+            DEFAULT_TARGET_WIDTH,
+            DEFAULT_TARGET_HEIGHT
         )
     }
 
-    fn load_config() -> Result<(Config, PathBuf), String> {
+    fn build_legacy_app(file_config: &TomlConfig) -> AppConfig {
+        let exe = file_config
+            .wow_exe
+            .as_deref()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .unwrap_or(LEGACY_DEFAULT_EXE)
+            .to_string();
+
+        let args = file_config
+            .wow_args
+            .clone()
+            .map(trim_args)
+            .filter(|parts| !parts.is_empty())
+            .unwrap_or_else(|| {
+                LEGACY_DEFAULT_ARGS
+                    .iter()
+                    .map(|part| (*part).to_string())
+                    .collect()
+            });
+
+        AppConfig {
+            name: infer_app_name("", &exe),
+            exe: exe.clone(),
+            args,
+            process_names: normalize_process_names(
+                file_config.process_names.clone().unwrap_or_default(),
+                &exe,
+                LEGACY_DEFAULT_PROCESS_NAMES,
+            ),
+            class_hints: normalize_matchers_with_defaults(
+                file_config.class_hints.clone().unwrap_or_default(),
+                LEGACY_DEFAULT_CLASS_HINTS,
+            ),
+            title_hints: normalize_matchers_with_defaults(
+                file_config.title_hints.clone().unwrap_or_default(),
+                LEGACY_DEFAULT_TITLE_HINTS,
+            ),
+            placement: WindowPlacement::BottomRight {
+                width: file_config.target_width.unwrap_or(DEFAULT_TARGET_WIDTH),
+                height: file_config.target_height.unwrap_or(DEFAULT_TARGET_HEIGHT),
+                bottom_margin: file_config.bottom_margin.unwrap_or(DEFAULT_BOTTOM_MARGIN),
+            },
+            wait_timeout: Duration::from_millis(
+                file_config
+                    .wait_timeout_ms
+                    .unwrap_or(file_config.defaults.wait_timeout_ms),
+            ),
+            wait_after_launch: Duration::from_millis(
+                file_config
+                    .wait_after_launch_ms
+                    .unwrap_or(file_config.defaults.wait_after_launch_ms),
+            ),
+            enforce_interval: Duration::from_millis(
+                file_config
+                    .enforce_interval_ms
+                    .unwrap_or(file_config.defaults.enforce_interval_ms),
+            ),
+            stable_confirmations: file_config
+                .stable_confirmations
+                .unwrap_or(file_config.defaults.stable_confirmations),
+            position_tolerance: file_config
+                .position_tolerance
+                .unwrap_or(file_config.defaults.position_tolerance),
+        }
+    }
+
+    fn build_app_config(entry: TomlAppConfig, defaults: &TomlDefaults) -> AppConfig {
+        let exe = entry.exe.trim().to_string();
+
+        AppConfig {
+            name: infer_app_name(&entry.name, &exe),
+            exe: exe.clone(),
+            args: trim_args(entry.args),
+            process_names: normalize_process_names(entry.process_names, &exe, &[]),
+            class_hints: normalize_matchers(entry.class_hints),
+            title_hints: normalize_matchers(entry.title_hints),
+            placement: WindowPlacement::Absolute {
+                x: entry.x,
+                y: entry.y,
+                width: entry.width,
+                height: entry.height,
+            },
+            wait_timeout: Duration::from_millis(
+                entry.wait_timeout_ms.unwrap_or(defaults.wait_timeout_ms),
+            ),
+            wait_after_launch: Duration::from_millis(
+                entry
+                    .wait_after_launch_ms
+                    .unwrap_or(defaults.wait_after_launch_ms),
+            ),
+            enforce_interval: Duration::from_millis(
+                entry
+                    .enforce_interval_ms
+                    .unwrap_or(defaults.enforce_interval_ms),
+            ),
+            stable_confirmations: entry
+                .stable_confirmations
+                .unwrap_or(defaults.stable_confirmations),
+            position_tolerance: entry
+                .position_tolerance
+                .unwrap_or(defaults.position_tolerance),
+        }
+    }
+
+    fn validate_app_config(app: &AppConfig) -> Result<(), String> {
+        if app.exe.trim().is_empty() {
+            return Err(format!("应用 [{}] 的 exe 不能为空", app.name));
+        }
+
+        let (width, height) = placement_size(&app.placement);
+        if width <= 0 {
+            return Err(format!("应用 [{}] 的 width 必须大于 0", app.name));
+        }
+        if height <= 0 {
+            return Err(format!("应用 [{}] 的 height 必须大于 0", app.name));
+        }
+        if app.stable_confirmations == 0 {
+            return Err(format!(
+                "应用 [{}] 的 stable_confirmations 必须大于 0",
+                app.name
+            ));
+        }
+        if app.position_tolerance < 0 {
+            return Err(format!(
+                "应用 [{}] 的 position_tolerance 不能小于 0",
+                app.name
+            ));
+        }
+        if app.enforce_interval == Duration::from_millis(0) {
+            return Err(format!(
+                "应用 [{}] 的 enforce_interval_ms 不能为 0",
+                app.name
+            ));
+        }
+        if app.wait_timeout == Duration::from_millis(0) {
+            return Err(format!("应用 [{}] 的 wait_timeout_ms 不能为 0", app.name));
+        }
+
+        Ok(())
+    }
+
+    fn load_config() -> Result<(LaunchConfig, PathBuf), String> {
         let config_path = if let Some(path) = find_existing_config() {
             path
         } else {
             let created = create_default_config()?;
-            println!("未找到配置文件，已生成默认配置: {}", created.display());
-            created
+            return Err(format!(
+                "未找到配置文件，已生成默认配置: {}。请先按需修改配置后再运行。",
+                created.display()
+            ));
         };
 
         if !config_path.exists() {
-            return Err(format!(
-                "配置文件路径不存在: {}",
-                config_path.display()
-            ));
+            return Err(format!("配置文件路径不存在: {}", config_path.display()));
         }
 
         if fs::metadata(&config_path).is_err() {
-            return Err(format!(
-                "无法访问配置文件: {}",
-                config_path.display()
-            ));
-        }
-
-        if fs::read_to_string(&config_path).is_err() {
-            // 某些场景下文件刚创建后读取失败，再尝试一次写默认模板并读取。
-            if let Err(err) = fs::write(&config_path, default_config_template()) {
-                return Err(format!(
-                    "配置文件损坏且重写失败 ({}): {}",
-                    config_path.display(),
-                    err
-                ));
-            }
+            return Err(format!("无法访问配置文件: {}", config_path.display()));
         }
 
         let config_text = fs::read_to_string(&config_path)
@@ -339,81 +696,43 @@ mod win_launcher {
         let file_config: TomlConfig = toml::from_str(&config_text)
             .map_err(|err| format!("解析 TOML 配置失败 ({}): {}", config_path.display(), err))?;
 
-        let wow_exe = if file_config.wow_exe.trim().is_empty() {
-            DEFAULT_WOW_EXE.to_string()
+        let mut apps = Vec::new();
+        if !file_config.apps.is_empty() {
+            for entry in file_config.apps.clone() {
+                if !entry.enabled {
+                    continue;
+                }
+                apps.push(build_app_config(entry, &file_config.defaults));
+            }
+        } else if file_config.has_legacy_fields() {
+            apps.push(build_legacy_app(&file_config));
         } else {
-            file_config.wow_exe.trim().to_string()
-        };
-        let wow_args: Vec<String> = if file_config.wow_args.is_empty() {
-            DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect()
-        } else {
-            file_config
-                .wow_args
-                .iter()
-                .map(|arg| arg.trim().to_string())
-                .filter(|arg| !arg.is_empty())
-                .collect()
-        };
-
-        let config = Config {
-            wow_exe,
-            wow_args: if wow_args.is_empty() {
-                DEFAULT_WOW_ARGS.iter().map(|arg| (*arg).to_string()).collect()
-            } else {
-                wow_args
-            },
-            class_hints: normalize_hints(file_config.class_hints, DEFAULT_CLASS_HINTS),
-            title_hints: normalize_hints(file_config.title_hints, DEFAULT_TITLE_HINTS),
-            target_width: file_config.target_width,
-            target_height: file_config.target_height,
-            bottom_margin: file_config.bottom_margin,
-            wait_timeout: Duration::from_millis(file_config.wait_timeout_ms),
-            wait_after_launch: Duration::from_millis(file_config.wait_after_launch_ms),
-            enforce_interval: Duration::from_millis(file_config.enforce_interval_ms),
-            stable_confirmations: file_config.stable_confirmations,
-            position_tolerance: file_config.position_tolerance,
-        };
-
-        if config.target_width <= 0 {
-            return Err("-- target_width 必须大于 0".to_string());
-        }
-        if config.target_height <= 0 {
-            return Err("-- target_height 必须大于 0".to_string());
-        }
-        if config.stable_confirmations == 0 {
-            return Err("-- stable_confirmations 必须大于 0".to_string());
-        }
-        if config.position_tolerance < 0 {
-            return Err("-- position_tolerance 不能小于 0".to_string());
-        }
-        if config.enforce_interval == Duration::from_millis(0) {
-            return Err("-- enforce_interval_ms 不能为 0".to_string());
-        }
-        if config.wait_timeout == Duration::from_millis(0) {
-            return Err("-- wait_timeout_ms 不能为 0".to_string());
+            return Err(format!(
+                "配置文件中没有可启动的应用，请添加 [[apps]] 条目 ({})",
+                config_path.display()
+            ));
         }
 
-        Ok((config, config_path))
-    }
+        if apps.is_empty() {
+            return Err("配置文件中的所有 [[apps]] 都被禁用了，没有可启动项".to_string());
+        }
 
-    fn process_exists(pid: u32) -> bool {
-        collect_processes().iter().any(|proc| proc.pid == pid)
+        for app in &apps {
+            validate_app_config(app)?;
+        }
+
+        Ok((LaunchConfig { apps }, config_path))
     }
 
     fn collect_candidate_pids(
         launched_pid: u32,
-        launcher_exit_pid: Option<u32>,
         before_launch: &HashSet<u32>,
+        process_names: &[String],
     ) -> Vec<u32> {
         let processes = collect_processes();
         let mut candidates = HashSet::new();
         candidates.insert(launched_pid);
 
-        if let Some(pid) = launcher_exit_pid {
-            candidates.insert(pid);
-        }
-
-        // 覆盖“启动器进程 -> 实际游戏进程”的场景：抓取新建子进程链。
         let mut changed = true;
         while changed {
             changed = false;
@@ -427,15 +746,11 @@ mod win_launcher {
             }
         }
 
-        // 同时兼容常见 WoW 进程名，避免只盯住一个可执行名。
         for proc in &processes {
             if before_launch.contains(&proc.pid) {
                 continue;
             }
-            if WOW_PROCESS_NAMES
-                .iter()
-                .any(|name| proc.exe_name.eq_ignore_ascii_case(name))
-            {
+            if process_names.iter().any(|name| proc.exe_name == *name) {
                 candidates.insert(proc.pid);
             }
         }
@@ -461,7 +776,8 @@ mod win_launcher {
             let mut class_buf = vec![0u16; 256];
             let copied = GetClassNameW(hwnd, &mut class_buf);
             if copied > 0 {
-                let class_name = String::from_utf16_lossy(&class_buf[..copied as usize]).to_lowercase();
+                let class_name =
+                    String::from_utf16_lossy(&class_buf[..copied as usize]).to_lowercase();
                 matched = context
                     .class_hints
                     .iter()
@@ -475,11 +791,9 @@ mod win_launcher {
                 let mut title_buf = vec![0u16; (title_len + 1) as usize];
                 let copied = GetWindowTextW(hwnd, &mut title_buf);
                 if copied > 0 {
-                    let title = String::from_utf16_lossy(&title_buf[..copied as usize]).to_lowercase();
-                    matched = context
-                        .title_hints
-                        .iter()
-                        .any(|hint| title.contains(hint));
+                    let title =
+                        String::from_utf16_lossy(&title_buf[..copied as usize]).to_lowercase();
+                    matched = context.title_hints.iter().any(|hint| title.contains(hint));
                 }
             }
         }
@@ -514,18 +828,58 @@ mod win_launcher {
         context.found
     }
 
-    fn target_rect(config: &Config) -> RECT {
-        unsafe {
-            let screen_width = GetSystemMetrics(SM_CXSCREEN);
-            let screen_height = GetSystemMetrics(SM_CYSCREEN);
-            let left = screen_width - config.target_width;
-            let top = screen_height - config.target_height - config.bottom_margin;
-            RECT {
-                left,
-                top,
-                right: left + config.target_width,
-                bottom: top + config.target_height,
-            }
+    fn target_rect(placement: &WindowPlacement) -> RECT {
+        match placement {
+            WindowPlacement::Absolute {
+                x,
+                y,
+                width,
+                height,
+            } => RECT {
+                left: *x,
+                top: *y,
+                right: *x + *width,
+                bottom: *y + *height,
+            },
+            WindowPlacement::BottomRight {
+                width,
+                height,
+                bottom_margin,
+            } => unsafe {
+                let screen_width = GetSystemMetrics(SM_CXSCREEN);
+                let screen_height = GetSystemMetrics(SM_CYSCREEN);
+                let left = screen_width - *width;
+                let top = screen_height - *height - *bottom_margin;
+                RECT {
+                    left,
+                    top,
+                    right: left + *width,
+                    bottom: top + *height,
+                }
+            },
+        }
+    }
+
+    fn placement_size(placement: &WindowPlacement) -> (i32, i32) {
+        match placement {
+            WindowPlacement::Absolute { width, height, .. }
+            | WindowPlacement::BottomRight { width, height, .. } => (*width, *height),
+        }
+    }
+
+    fn placement_description(placement: &WindowPlacement) -> String {
+        match placement {
+            WindowPlacement::Absolute {
+                x,
+                y,
+                width,
+                height,
+            } => format!("x={}, y={}, {}x{}", x, y, width, height),
+            WindowPlacement::BottomRight {
+                width,
+                height,
+                bottom_margin,
+            } => format!("右下角, 底边距={}, {}x{}", bottom_margin, width, height),
         }
     }
 
@@ -533,28 +887,28 @@ mod win_launcher {
         (a - b).abs() <= tolerance
     }
 
-    fn is_window_in_target(hwnd: HWND, config: &Config) -> bool {
+    fn is_window_in_target(hwnd: HWND, app: &AppConfig) -> bool {
         unsafe {
             let mut current = RECT::default();
             if GetWindowRect(hwnd, &mut current).is_err() {
                 return false;
             }
-            let target = target_rect(config);
-            near_equal(current.left, target.left, config.position_tolerance)
-                && near_equal(current.top, target.top, config.position_tolerance)
-                && near_equal(current.right, target.right, config.position_tolerance)
-                && near_equal(current.bottom, target.bottom, config.position_tolerance)
+            let target = target_rect(&app.placement);
+            near_equal(current.left, target.left, app.position_tolerance)
+                && near_equal(current.top, target.top, app.position_tolerance)
+                && near_equal(current.right, target.right, app.position_tolerance)
+                && near_equal(current.bottom, target.bottom, app.position_tolerance)
         }
     }
 
-    fn apply_window_layout(hwnd: HWND, config: &Config) -> bool {
+    fn apply_window_layout(hwnd: HWND, app: &AppConfig) -> bool {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
                 return false;
             }
 
             let _ = ShowWindow(hwnd, SW_RESTORE);
-            let target = target_rect(config);
+            let target = target_rect(&app.placement);
             let width = target.right - target.left;
             let height = target.bottom - target.top;
 
@@ -571,89 +925,71 @@ mod win_launcher {
         }
     }
 
-    fn ensure_window_layout(hwnd: HWND, config: &Config) -> bool {
+    fn ensure_window_layout(hwnd: HWND, app: &AppConfig) -> bool {
         unsafe {
             if !IsWindow(hwnd).as_bool() {
                 return false;
             }
         }
 
-        if !is_window_in_target(hwnd, config) {
-            if !apply_window_layout(hwnd, config) {
+        if !is_window_in_target(hwnd, app) {
+            if !apply_window_layout(hwnd, app) {
                 return false;
             }
 
             sleep(Duration::from_millis(50));
-            return is_window_in_target(hwnd, config);
+            return is_window_in_target(hwnd, app);
         }
 
         true
     }
 
-    pub fn run() {
-        let (config, config_path) = match load_config() {
-            Ok(pair) => pair,
-            Err(err) => {
-                eprintln!("{}", err);
-                std::process::exit(2);
-            }
-        };
-        let wow_exe_path = resolve_wow_exe_path(&config.wow_exe, &config_path);
-
-        if !wow_exe_path.exists() {
-            eprintln!(
-                "未找到 {} (来自配置文件 {})",
-                wow_exe_path.display(),
+    fn launch_app(app: &AppConfig, config_path: &Path) -> Result<(), String> {
+        let exe_path = resolve_exe_path(&app.exe, config_path);
+        if !exe_path.exists() {
+            return Err(format!(
+                "应用 [{}] 未找到可执行文件 {} (来自配置文件 {})",
+                app.name,
+                exe_path.display(),
                 config_path.display()
-            );
-            std::process::exit(1);
+            ));
         }
 
-        let before_launch: HashSet<u32> = collect_processes().into_iter().map(|p| p.pid).collect();
+        let before_launch: HashSet<u32> = collect_processes()
+            .into_iter()
+            .map(|proc| proc.pid)
+            .collect();
 
-        let mut child = match Command::new(&wow_exe_path).args(&config.wow_args).spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                eprintln!("启动 {} 失败: {}", wow_exe_path.display(), err);
-                std::process::exit(1);
-            }
-        };
-
-        let launched_pid = child.id();
+        let launched_pid = Command::new(&exe_path)
+            .args(&app.args)
+            .spawn()
+            .map_err(|err| {
+                format!(
+                    "应用 [{}] 启动失败 ({}): {}",
+                    app.name,
+                    exe_path.display(),
+                    err
+                )
+            })?
+            .id();
         let start = Instant::now();
-        let mut launcher_exit_pid: Option<u32> = None;
 
         println!(
-            "已启动 WoW，等待窗口并固定到右下角小窗... (类名关键字: {:?}, 标题关键字: {:?})",
-            config.class_hints, config.title_hints
+            "启动 [{}] -> {}，目标位置: {}",
+            app.name,
+            exe_path.display(),
+            placement_description(&app.placement)
         );
 
         let mut stable_hits: u32 = 0;
-        let first_layout_ok = loop {
-            if launcher_exit_pid.is_none() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        if let Some(code) = status.code() {
-                            if code > 0 {
-                                let pid = code as u32;
-                                if process_exists(pid) {
-                                    launcher_exit_pid = Some(pid);
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => {}
-                }
-            }
-
-            if start.elapsed() >= config.wait_after_launch {
-                let pids = collect_candidate_pids(launched_pid, launcher_exit_pid, &before_launch);
-                let windows = find_windows(&pids, &config.class_hints, &config.title_hints);
+        let layout_ok = loop {
+            if start.elapsed() >= app.wait_after_launch {
+                let pids = collect_candidate_pids(launched_pid, &before_launch, &app.process_names);
+                let windows = find_windows(&pids, &app.class_hints, &app.title_hints);
 
                 let mut any_stable = false;
                 for hwnd in windows {
-                    if ensure_window_layout(hwnd, &config) {
+                    if ensure_window_layout(hwnd, app) {
                         any_stable = true;
                     }
                 }
@@ -664,27 +1000,47 @@ mod win_launcher {
                     stable_hits = 0;
                 }
 
-                if stable_hits >= config.stable_confirmations {
+                if stable_hits >= app.stable_confirmations {
                     break true;
                 }
             }
 
-            if start.elapsed() > config.wait_timeout {
+            if start.elapsed() > app.wait_timeout {
                 break false;
             }
 
-            sleep(config.enforce_interval);
+            sleep(app.enforce_interval);
         };
 
-        if !first_layout_ok {
-            eprintln!("超时：未能找到并固定 WoW 主窗口，请确认是窗口模式启动。");
-            std::process::exit(1);
+        if !layout_ok {
+            return Err(format!(
+                "应用 [{}] 超时：未能找到并固定窗口，请确认它会创建可见窗口，或补充 process_names/class_hints/title_hints",
+                app.name
+            ));
         }
 
-        println!(
-            "已将 WoW 固定为右下角小窗（{}x{}），启动器自动退出",
-            config.target_width, config.target_height
-        );
+        let (width, height) = placement_size(&app.placement);
+        println!("应用 [{}] 已固定完成 ({}x{})", app.name, width, height);
+        Ok(())
+    }
+
+    pub fn run() {
+        let (config, config_path) = match load_config() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(2);
+            }
+        };
+
+        for app in &config.apps {
+            if let Err(err) = launch_app(app, &config_path) {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
+        }
+
+        println!("全部应用处理完成，启动器退出");
     }
 }
 

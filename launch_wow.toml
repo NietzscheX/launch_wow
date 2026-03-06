@@ -1,21 +1,40 @@
-# WoW 启动文件路径:
-# 1) 绝对路径示例: "D:\\Games\\WoW\\Wow.exe"
-# 2) 相对路径示例: "Wow.exe" 或 ".\\_retail_\\Wow.exe"（相对于本配置文件目录）
-wow_exe = "Wow.exe"
-wow_args = ["-windowed"]
+# 通用多程序启动配置
+# 1) exe 如果不是绝对路径，会按“本配置文件所在目录”解析
+# 2) 每个 [[apps]] 会按顺序依次启动
+# 3) x / y 以主屏幕左上角为原点，单位像素
 
-# 窗口类名关键字（不区分大小写）
-class_hints = ["GxWindowClass"]
-
-# 窗口标题关键字（不区分大小写）
-title_hints = ["World of Warcraft"]
-
-target_width = 500
-target_height = 500
-bottom_margin = 40
-
+[defaults]
 wait_timeout_ms = 60000
 wait_after_launch_ms = 0
 enforce_interval_ms = 200
 stable_confirmations = 5
 position_tolerance = 4
+
+[[apps]]
+name = "wow"
+exe = "Wow.exe"
+args = ["-windowed"]
+process_names = [
+  "wow.exe",
+  "wow-64.exe",
+  "wowclassic.exe",
+  "wowclassict.exe",
+  "wowclasst.exe",
+  "wowb.exe",
+]
+class_hints = ["GxWindowClass"]
+title_hints = ["World of Warcraft"]
+x = 100
+y = 100
+width = 500
+height = 500
+
+[[apps]]
+enabled = false
+name = "notepad"
+exe = "C:\\Windows\\System32\\notepad.exe"
+title_hints = ["notepad", "记事本"]
+x = 650
+y = 100
+width = 900
+height = 700
