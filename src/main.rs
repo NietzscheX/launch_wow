@@ -2,6 +2,7 @@
 mod win_launcher {
     use serde::Deserialize;
     use std::collections::HashSet;
+    use std::ffi::c_void;
     use std::fs;
     use std::mem::size_of;
     use std::path::{Path, PathBuf};
@@ -10,15 +11,24 @@ mod win_launcher {
     use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT};
+    use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_RETURN, VK_TAB,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowPos,
-        ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SW_RESTORE,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
+        SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SW_RESTORE,
     };
 
     const CONFIG_FILE_NAMES: &[&str] = &["launch_apps.toml", "launch_wow.toml"];
@@ -47,6 +57,17 @@ mod win_launcher {
     const DEFAULT_ENFORCE_INTERVAL_MS: u64 = 200;
     const DEFAULT_STABLE_CONFIRMATIONS: u32 = 5;
     const DEFAULT_POSITION_TOLERANCE: i32 = 4;
+    const DEFAULT_WOW_STATE_POLL_INTERVAL_MS: u64 = 500;
+    const DEFAULT_WOW_LOGIN_TIMEOUT_MS: u64 = 60_000;
+    const DEFAULT_WOW_KEY_INPUT_DELAY_MS: u64 = 40;
+    const DEFAULT_WOW_AFTER_LOGIN_SUBMIT_DELAY_MS: u64 = 1_500;
+    const DEFAULT_WOW_AFTER_ENTER_WORLD_DELAY_MS: u64 = 6_000;
+
+    const WOW_GAME_STATE_ADDRESS: usize = 0x90753C;
+    const WOW_SELECTED_CHARACTER_INDEX_ADDRESS: usize = 0xAD7414;
+    const WOW_STATE_ACCOUNT_SELECT: u32 = 0x01;
+    const WOW_STATE_CHARACTER_SELECT_OR_INGAME: u32 = 0x15;
+    const WOW_STATE_LOGIN_SCREEN: u32 = 0x16;
 
     #[derive(Clone)]
     struct ProcessInfo {
@@ -75,6 +96,16 @@ mod win_launcher {
         enforce_interval_ms: Option<u64>,
         stable_confirmations: Option<u32>,
         position_tolerance: Option<i32>,
+        wow_auto_login: Option<bool>,
+        wow_account: Option<String>,
+        wow_password: Option<String>,
+        wow_password_env: Option<String>,
+        wow_character_index: Option<u32>,
+        wow_state_poll_interval_ms: Option<u64>,
+        wow_login_timeout_ms: Option<u64>,
+        wow_key_input_delay_ms: Option<u64>,
+        wow_after_login_submit_delay_ms: Option<u64>,
+        wow_after_enter_world_delay_ms: Option<u64>,
     }
 
     impl Default for TomlConfig {
@@ -95,6 +126,16 @@ mod win_launcher {
                 enforce_interval_ms: None,
                 stable_confirmations: None,
                 position_tolerance: None,
+                wow_auto_login: None,
+                wow_account: None,
+                wow_password: None,
+                wow_password_env: None,
+                wow_character_index: None,
+                wow_state_poll_interval_ms: None,
+                wow_login_timeout_ms: None,
+                wow_key_input_delay_ms: None,
+                wow_after_login_submit_delay_ms: None,
+                wow_after_enter_world_delay_ms: None,
             }
         }
     }
@@ -114,6 +155,16 @@ mod win_launcher {
                 || self.enforce_interval_ms.is_some()
                 || self.stable_confirmations.is_some()
                 || self.position_tolerance.is_some()
+                || self.wow_auto_login.is_some()
+                || self.wow_account.is_some()
+                || self.wow_password.is_some()
+                || self.wow_password_env.is_some()
+                || self.wow_character_index.is_some()
+                || self.wow_state_poll_interval_ms.is_some()
+                || self.wow_login_timeout_ms.is_some()
+                || self.wow_key_input_delay_ms.is_some()
+                || self.wow_after_login_submit_delay_ms.is_some()
+                || self.wow_after_enter_world_delay_ms.is_some()
         }
     }
 
@@ -158,6 +209,16 @@ mod win_launcher {
         enforce_interval_ms: Option<u64>,
         stable_confirmations: Option<u32>,
         position_tolerance: Option<i32>,
+        wow_auto_login: bool,
+        wow_account: String,
+        wow_password: String,
+        wow_password_env: String,
+        wow_character_index: u32,
+        wow_state_poll_interval_ms: Option<u64>,
+        wow_login_timeout_ms: Option<u64>,
+        wow_key_input_delay_ms: Option<u64>,
+        wow_after_login_submit_delay_ms: Option<u64>,
+        wow_after_enter_world_delay_ms: Option<u64>,
     }
 
     impl Default for TomlAppConfig {
@@ -179,6 +240,16 @@ mod win_launcher {
                 enforce_interval_ms: None,
                 stable_confirmations: None,
                 position_tolerance: None,
+                wow_auto_login: false,
+                wow_account: String::new(),
+                wow_password: String::new(),
+                wow_password_env: String::new(),
+                wow_character_index: 0,
+                wow_state_poll_interval_ms: None,
+                wow_login_timeout_ms: None,
+                wow_key_input_delay_ms: None,
+                wow_after_login_submit_delay_ms: None,
+                wow_after_enter_world_delay_ms: None,
             }
         }
     }
@@ -202,6 +273,19 @@ mod win_launcher {
         enforce_interval: Duration,
         stable_confirmations: u32,
         position_tolerance: i32,
+        wow_login: Option<WowLoginConfig>,
+    }
+
+    #[derive(Clone)]
+    struct WowLoginConfig {
+        account: String,
+        password: String,
+        character_index: u32,
+        state_poll_interval: Duration,
+        login_timeout: Duration,
+        key_input_delay: Duration,
+        after_login_submit_delay: Duration,
+        after_enter_world_delay: Duration,
     }
 
     #[derive(Clone)]
@@ -358,6 +442,107 @@ mod win_launcher {
             .to_string()
     }
 
+    fn resolve_wow_password(
+        app_name: &str,
+        password: &str,
+        password_env: &str,
+    ) -> Result<String, String> {
+        let trimmed_password = password.trim();
+        if !trimmed_password.is_empty() {
+            return Ok(trimmed_password.to_string());
+        }
+
+        let trimmed_env = password_env.trim();
+        if trimmed_env.is_empty() {
+            return Err(format!(
+                "应用 [{}] 启用了 WoW 自动登录，但 wow_password 为空",
+                app_name
+            ));
+        }
+
+        let value = std::env::var(trimmed_env).map_err(|_| {
+            format!(
+                "应用 [{}] 启用了 WoW 自动登录，但环境变量 {} 不存在",
+                app_name, trimmed_env
+            )
+        })?;
+
+        let trimmed_value = value.trim();
+        if trimmed_value.is_empty() {
+            return Err(format!(
+                "应用 [{}] 启用了 WoW 自动登录，但环境变量 {} 为空",
+                app_name, trimmed_env
+            ));
+        }
+
+        Ok(trimmed_value.to_string())
+    }
+
+    fn build_wow_login_config(
+        app_name: &str,
+        enabled: bool,
+        account: &str,
+        password: &str,
+        password_env: &str,
+        character_index: u32,
+        state_poll_interval_ms: Option<u64>,
+        login_timeout_ms: Option<u64>,
+        key_input_delay_ms: Option<u64>,
+        after_login_submit_delay_ms: Option<u64>,
+        after_enter_world_delay_ms: Option<u64>,
+    ) -> Result<Option<WowLoginConfig>, String> {
+        if !enabled {
+            return Ok(None);
+        }
+
+        let trimmed_account = account.trim();
+        if trimmed_account.is_empty() {
+            return Err(format!(
+                "应用 [{}] 启用了 WoW 自动登录，但 wow_account 为空",
+                app_name
+            ));
+        }
+
+        let resolved_password = resolve_wow_password(app_name, password, password_env)?;
+        let state_poll_interval = Duration::from_millis(
+            state_poll_interval_ms.unwrap_or(DEFAULT_WOW_STATE_POLL_INTERVAL_MS),
+        );
+        let login_timeout =
+            Duration::from_millis(login_timeout_ms.unwrap_or(DEFAULT_WOW_LOGIN_TIMEOUT_MS));
+        let key_input_delay =
+            Duration::from_millis(key_input_delay_ms.unwrap_or(DEFAULT_WOW_KEY_INPUT_DELAY_MS));
+        let after_login_submit_delay = Duration::from_millis(
+            after_login_submit_delay_ms.unwrap_or(DEFAULT_WOW_AFTER_LOGIN_SUBMIT_DELAY_MS),
+        );
+        let after_enter_world_delay = Duration::from_millis(
+            after_enter_world_delay_ms.unwrap_or(DEFAULT_WOW_AFTER_ENTER_WORLD_DELAY_MS),
+        );
+
+        if state_poll_interval == Duration::from_millis(0) {
+            return Err(format!(
+                "应用 [{}] 的 wow_state_poll_interval_ms 不能为 0",
+                app_name
+            ));
+        }
+        if login_timeout == Duration::from_millis(0) {
+            return Err(format!(
+                "应用 [{}] 的 wow_login_timeout_ms 不能为 0",
+                app_name
+            ));
+        }
+
+        Ok(Some(WowLoginConfig {
+            account: trimmed_account.to_string(),
+            password: resolved_password,
+            character_index,
+            state_poll_interval,
+            login_timeout,
+            key_input_delay,
+            after_login_submit_delay,
+            after_enter_world_delay,
+        }))
+    }
+
     fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -484,6 +669,7 @@ mod win_launcher {
             "# launch_apps.toml\n\
              # 相对路径会按“配置文件所在目录”解析。\n\
              # 多个 [[apps]] 会按顺序依次启动，并把窗口固定到指定位置和大小。\n\
+             # WoW 4.3.4 自动登录支持账号/密码和角色索引（从 0 开始）。\n\
              \n\
              [defaults]\n\
              wait_timeout_ms = {}\n\
@@ -503,6 +689,11 @@ mod win_launcher {
              y = {}\n\
              width = {}\n\
              height = {}\n\
+             wow_auto_login = false\n\
+             wow_account = \"your-account\"\n\
+             wow_password = \"your-password\"\n\
+             wow_character_index = 0\n\
+             # wow_password_env = \"WOW_PASSWORD\"\n\
              \n\
              [[apps]]\n\
              enabled = false\n\
@@ -530,7 +721,7 @@ mod win_launcher {
         )
     }
 
-    fn build_legacy_app(file_config: &TomlConfig) -> AppConfig {
+    fn build_legacy_app(file_config: &TomlConfig) -> Result<AppConfig, String> {
         let exe = file_config
             .wow_exe
             .as_deref()
@@ -551,8 +742,23 @@ mod win_launcher {
                     .collect()
             });
 
-        AppConfig {
-            name: infer_app_name("", &exe),
+        let app_name = infer_app_name("", &exe);
+        let wow_login = build_wow_login_config(
+            &app_name,
+            file_config.wow_auto_login.unwrap_or(false),
+            file_config.wow_account.as_deref().unwrap_or(""),
+            file_config.wow_password.as_deref().unwrap_or(""),
+            file_config.wow_password_env.as_deref().unwrap_or(""),
+            file_config.wow_character_index.unwrap_or(0),
+            file_config.wow_state_poll_interval_ms,
+            file_config.wow_login_timeout_ms,
+            file_config.wow_key_input_delay_ms,
+            file_config.wow_after_login_submit_delay_ms,
+            file_config.wow_after_enter_world_delay_ms,
+        )?;
+
+        Ok(AppConfig {
+            name: app_name,
             exe: exe.clone(),
             args,
             process_names: normalize_process_names(
@@ -594,14 +800,32 @@ mod win_launcher {
             position_tolerance: file_config
                 .position_tolerance
                 .unwrap_or(file_config.defaults.position_tolerance),
-        }
+            wow_login,
+        })
     }
 
-    fn build_app_config(entry: TomlAppConfig, defaults: &TomlDefaults) -> AppConfig {
+    fn build_app_config(
+        entry: TomlAppConfig,
+        defaults: &TomlDefaults,
+    ) -> Result<AppConfig, String> {
         let exe = entry.exe.trim().to_string();
+        let app_name = infer_app_name(&entry.name, &exe);
+        let wow_login = build_wow_login_config(
+            &app_name,
+            entry.wow_auto_login,
+            &entry.wow_account,
+            &entry.wow_password,
+            &entry.wow_password_env,
+            entry.wow_character_index,
+            entry.wow_state_poll_interval_ms,
+            entry.wow_login_timeout_ms,
+            entry.wow_key_input_delay_ms,
+            entry.wow_after_login_submit_delay_ms,
+            entry.wow_after_enter_world_delay_ms,
+        )?;
 
-        AppConfig {
-            name: infer_app_name(&entry.name, &exe),
+        Ok(AppConfig {
+            name: app_name,
             exe: exe.clone(),
             args: trim_args(entry.args),
             process_names: normalize_process_names(entry.process_names, &exe, &[]),
@@ -632,7 +856,8 @@ mod win_launcher {
             position_tolerance: entry
                 .position_tolerance
                 .unwrap_or(defaults.position_tolerance),
-        }
+            wow_login,
+        })
     }
 
     fn validate_app_config(app: &AppConfig) -> Result<(), String> {
@@ -702,10 +927,10 @@ mod win_launcher {
                 if !entry.enabled {
                     continue;
                 }
-                apps.push(build_app_config(entry, &file_config.defaults));
+                apps.push(build_app_config(entry, &file_config.defaults)?);
             }
         } else if file_config.has_legacy_fields() {
-            apps.push(build_legacy_app(&file_config));
+            apps.push(build_legacy_app(&file_config)?);
         } else {
             return Err(format!(
                 "配置文件中没有可启动的应用，请添加 [[apps]] 条目 ({})",
@@ -944,6 +1169,299 @@ mod win_launcher {
         true
     }
 
+    fn wow_state_name(state: u32) -> &'static str {
+        match state {
+            WOW_STATE_ACCOUNT_SELECT => "账号选择界面",
+            WOW_STATE_LOGIN_SCREEN => "登录界面",
+            WOW_STATE_CHARACTER_SELECT_OR_INGAME => "角色选择/游戏内",
+            _ => "未知状态",
+        }
+    }
+
+    fn focus_window(hwnd: HWND) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        sleep(Duration::from_millis(150));
+    }
+
+    fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    fn send_input_batch(inputs: &[INPUT]) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+
+        let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            return Err(format!(
+                "发送键盘输入失败，期望 {} 个事件，实际 {} 个",
+                inputs.len(),
+                sent
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn send_virtual_key(vk: VIRTUAL_KEY) -> Result<(), String> {
+        let inputs = [
+            keyboard_input(vk, 0, KEYBD_EVENT_FLAGS(0)),
+            keyboard_input(vk, 0, KEYEVENTF_KEYUP),
+        ];
+        send_input_batch(&inputs)
+    }
+
+    fn send_modified_key(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<(), String> {
+        let inputs = [
+            keyboard_input(modifier, 0, KEYBD_EVENT_FLAGS(0)),
+            keyboard_input(key, 0, KEYBD_EVENT_FLAGS(0)),
+            keyboard_input(key, 0, KEYEVENTF_KEYUP),
+            keyboard_input(modifier, 0, KEYEVENTF_KEYUP),
+        ];
+        send_input_batch(&inputs)
+    }
+
+    fn send_unicode_text(text: &str, key_delay: Duration) -> Result<(), String> {
+        for ch in text.encode_utf16() {
+            let inputs = [
+                keyboard_input(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE),
+                keyboard_input(VIRTUAL_KEY(0), ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+            ];
+            send_input_batch(&inputs)?;
+            if key_delay > Duration::from_millis(0) {
+                sleep(key_delay);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_active_field(key_delay: Duration) -> Result<(), String> {
+        send_modified_key(VK_CONTROL, VIRTUAL_KEY(0x41))?;
+        if key_delay > Duration::from_millis(0) {
+            sleep(key_delay);
+        }
+        send_virtual_key(VK_BACK)?;
+        if key_delay > Duration::from_millis(0) {
+            sleep(key_delay);
+        }
+        Ok(())
+    }
+
+    fn submit_wow_credentials(
+        hwnd: HWND,
+        wow_login: &WowLoginConfig,
+        app_name: &str,
+    ) -> Result<(), String> {
+        focus_window(hwnd);
+        clear_active_field(wow_login.key_input_delay)?;
+        send_unicode_text(&wow_login.account, wow_login.key_input_delay)?;
+        send_virtual_key(VK_TAB)?;
+        if wow_login.key_input_delay > Duration::from_millis(0) {
+            sleep(wow_login.key_input_delay);
+        }
+        clear_active_field(wow_login.key_input_delay)?;
+        send_unicode_text(&wow_login.password, wow_login.key_input_delay)?;
+        send_virtual_key(VK_RETURN)?;
+        println!("应用 [{}] 已提交 WoW 账号密码", app_name);
+        Ok(())
+    }
+
+    fn open_process_for_wow(pid: u32) -> Result<HANDLE, String> {
+        unsafe {
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION
+                    | PROCESS_VM_READ
+                    | PROCESS_VM_WRITE
+                    | PROCESS_VM_OPERATION,
+                false,
+                pid,
+            )
+            .map_err(|err| format!("打开 WoW 进程失败 (pid={}): {}", pid, err))
+        }
+    }
+
+    fn read_process_u32(handle: HANDLE, address: usize) -> Result<u32, String> {
+        let mut value = 0u32;
+        let mut bytes_read = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                address as *const c_void,
+                &mut value as *mut u32 as *mut c_void,
+                size_of::<u32>(),
+                Some(&mut bytes_read),
+            )
+            .map_err(|err| format!("读取 WoW 内存失败 (0x{:X}): {}", address, err))?;
+        }
+
+        if bytes_read != size_of::<u32>() {
+            return Err(format!(
+                "读取 WoW 内存长度异常 (0x{:X}): {}",
+                address, bytes_read
+            ));
+        }
+
+        Ok(value)
+    }
+
+    fn write_process_u32(handle: HANDLE, address: usize, value: u32) -> Result<(), String> {
+        let mut bytes_written = 0usize;
+        unsafe {
+            WriteProcessMemory(
+                handle,
+                address as *const c_void,
+                &value as *const u32 as *const c_void,
+                size_of::<u32>(),
+                Some(&mut bytes_written),
+            )
+            .map_err(|err| format!("写入 WoW 内存失败 (0x{:X}): {}", address, err))?;
+        }
+
+        if bytes_written != size_of::<u32>() {
+            return Err(format!(
+                "写入 WoW 内存长度异常 (0x{:X}): {}",
+                address, bytes_written
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn select_target_pid(candidate_pids: &[u32], process_names: &[String]) -> Option<u32> {
+        if candidate_pids.is_empty() {
+            return None;
+        }
+
+        let processes = collect_processes();
+        for pid in candidate_pids {
+            if processes.iter().any(|proc| {
+                proc.pid == *pid && process_names.iter().any(|name| proc.exe_name == *name)
+            }) {
+                return Some(*pid);
+            }
+        }
+
+        candidate_pids.first().copied()
+    }
+
+    fn run_wow_auto_login(
+        app: &AppConfig,
+        launched_pid: u32,
+        before_launch: &HashSet<u32>,
+    ) -> Result<(), String> {
+        let wow_login = match &app.wow_login {
+            Some(config) => config,
+            None => return Ok(()),
+        };
+
+        println!(
+            "应用 [{}] 开始执行 WoW 自动登录，目标角色索引: {}",
+            app.name, wow_login.character_index
+        );
+
+        let start = Instant::now();
+        let mut credentials_submitted = false;
+        let mut account_select_confirmed = false;
+        let mut enter_world_sent = false;
+        let mut last_state: Option<u32> = None;
+
+        loop {
+            if start.elapsed() > wow_login.login_timeout {
+                let state_text = last_state
+                    .map(|state| format!("0x{:X} ({})", state, wow_state_name(state)))
+                    .unwrap_or_else(|| "未知".to_string());
+                return Err(format!(
+                    "应用 [{}] WoW 自动登录超时，最后状态: {}",
+                    app.name, state_text
+                ));
+            }
+
+            let candidate_pids =
+                collect_candidate_pids(launched_pid, before_launch, &app.process_names);
+            let Some(target_pid) = select_target_pid(&candidate_pids, &app.process_names) else {
+                sleep(wow_login.state_poll_interval);
+                continue;
+            };
+            let windows = find_windows(&candidate_pids, &app.class_hints, &app.title_hints);
+            let Some(hwnd) = windows.first().copied() else {
+                sleep(wow_login.state_poll_interval);
+                continue;
+            };
+
+            let handle = open_process_for_wow(target_pid)?;
+            let state_result = read_process_u32(handle, WOW_GAME_STATE_ADDRESS);
+            close_handle(handle);
+            let state = state_result?;
+            last_state = Some(state);
+
+            match state {
+                WOW_STATE_ACCOUNT_SELECT if !account_select_confirmed => {
+                    focus_window(hwnd);
+                    send_virtual_key(VK_RETURN)?;
+                    account_select_confirmed = true;
+                    println!("应用 [{}] 已处理账号选择界面", app.name);
+                    sleep(wow_login.state_poll_interval);
+                }
+                WOW_STATE_LOGIN_SCREEN if !credentials_submitted => {
+                    submit_wow_credentials(hwnd, wow_login, &app.name)?;
+                    credentials_submitted = true;
+                    sleep(wow_login.after_login_submit_delay);
+                }
+                WOW_STATE_CHARACTER_SELECT_OR_INGAME if !enter_world_sent => {
+                    let handle = open_process_for_wow(target_pid)?;
+                    let current_index_result =
+                        read_process_u32(handle, WOW_SELECTED_CHARACTER_INDEX_ADDRESS);
+                    let current_index = match current_index_result {
+                        Ok(value) => value,
+                        Err(err) => {
+                            close_handle(handle);
+                            return Err(err);
+                        }
+                    };
+                    if current_index != wow_login.character_index {
+                        if let Err(err) = write_process_u32(
+                            handle,
+                            WOW_SELECTED_CHARACTER_INDEX_ADDRESS,
+                            wow_login.character_index,
+                        ) {
+                            close_handle(handle);
+                            return Err(err);
+                        }
+                    }
+                    close_handle(handle);
+
+                    focus_window(hwnd);
+                    send_virtual_key(VK_RETURN)?;
+                    enter_world_sent = true;
+                    println!(
+                        "应用 [{}] 已选择角色索引 {} 并触发进入游戏",
+                        app.name, wow_login.character_index
+                    );
+                    sleep(wow_login.after_enter_world_delay);
+                    return Ok(());
+                }
+                _ => {
+                    sleep(wow_login.state_poll_interval);
+                }
+            }
+        }
+    }
+
     fn launch_app(app: &AppConfig, config_path: &Path) -> Result<(), String> {
         let exe_path = resolve_exe_path(&app.exe, config_path);
         if !exe_path.exists() {
@@ -1018,6 +1536,8 @@ mod win_launcher {
                 app.name
             ));
         }
+
+        run_wow_auto_login(app, launched_pid, &before_launch)?;
 
         let (width, height) = placement_size(&app.placement);
         println!("应用 [{}] 已固定完成 ({}x{})", app.name, width, height);

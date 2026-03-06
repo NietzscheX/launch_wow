@@ -2,6 +2,7 @@
 # 1) exe 如果不是绝对路径，会按“本配置文件所在目录”解析
 # 2) 每个 [[apps]] 会按顺序依次启动
 # 3) x / y 以主屏幕左上角为原点，单位像素
+# 4) WoW 4.3.4 自动登录目前按角色索引选择角色，0 表示第一个角色
 
 [defaults]
 wait_timeout_ms = 60000
@@ -28,6 +29,11 @@ x = 100
 y = 100
 width = 500
 height = 500
+wow_auto_login = false
+wow_account = "your-account"
+wow_password = "your-password"
+wow_character_index = 0
+# wow_password_env = "WOW_PASSWORD"
 
 [[apps]]
 enabled = false
