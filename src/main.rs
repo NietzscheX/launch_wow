@@ -478,6 +478,17 @@ mod win_launcher {
         Ok(trimmed_value.to_string())
     }
 
+    fn should_enable_wow_login(
+        explicit_enabled: bool,
+        account: &str,
+        password: &str,
+        password_env: &str,
+    ) -> bool {
+        explicit_enabled
+            || (!account.trim().is_empty()
+                && (!password.trim().is_empty() || !password_env.trim().is_empty()))
+    }
+
     fn build_wow_login_config(
         app_name: &str,
         enabled: bool,
@@ -491,7 +502,8 @@ mod win_launcher {
         after_login_submit_delay_ms: Option<u64>,
         after_enter_world_delay_ms: Option<u64>,
     ) -> Result<Option<WowLoginConfig>, String> {
-        if !enabled {
+        let effective_enabled = should_enable_wow_login(enabled, account, password, password_env);
+        if !effective_enabled {
             return Ok(None);
         }
 
@@ -1377,7 +1389,7 @@ mod win_launcher {
         let start = Instant::now();
         let mut credentials_submitted = false;
         let mut account_select_confirmed = false;
-        let mut enter_world_sent = false;
+        let mut enter_world_started_at: Option<Instant> = None;
         let mut last_state: Option<u32> = None;
 
         loop {
@@ -1410,50 +1422,62 @@ mod win_launcher {
             last_state = Some(state);
 
             match state {
-                WOW_STATE_ACCOUNT_SELECT if !account_select_confirmed => {
+                WOW_STATE_ACCOUNT_SELECT
+                    if !account_select_confirmed && enter_world_started_at.is_none() =>
+                {
                     focus_window(hwnd);
                     send_virtual_key(VK_RETURN)?;
                     account_select_confirmed = true;
                     println!("应用 [{}] 已处理账号选择界面", app.name);
                     sleep(wow_login.state_poll_interval);
                 }
-                WOW_STATE_LOGIN_SCREEN if !credentials_submitted => {
+                WOW_STATE_LOGIN_SCREEN
+                    if !credentials_submitted && enter_world_started_at.is_none() =>
+                {
                     submit_wow_credentials(hwnd, wow_login, &app.name)?;
                     credentials_submitted = true;
                     sleep(wow_login.after_login_submit_delay);
                 }
-                WOW_STATE_CHARACTER_SELECT_OR_INGAME if !enter_world_sent => {
-                    let handle = open_process_for_wow(target_pid)?;
-                    let current_index_result =
-                        read_process_u32(handle, WOW_SELECTED_CHARACTER_INDEX_ADDRESS);
-                    let current_index = match current_index_result {
-                        Ok(value) => value,
-                        Err(err) => {
-                            close_handle(handle);
-                            return Err(err);
+                WOW_STATE_CHARACTER_SELECT_OR_INGAME => {
+                    if let Some(started_at) = enter_world_started_at {
+                        if started_at.elapsed() >= wow_login.after_enter_world_delay {
+                            println!("应用 [{}] 已完成 WoW 登录，启动器退出", app.name);
+                            return Ok(());
                         }
-                    };
-                    if current_index != wow_login.character_index {
-                        if let Err(err) = write_process_u32(
-                            handle,
-                            WOW_SELECTED_CHARACTER_INDEX_ADDRESS,
-                            wow_login.character_index,
-                        ) {
-                            close_handle(handle);
-                            return Err(err);
-                        }
-                    }
-                    close_handle(handle);
 
-                    focus_window(hwnd);
-                    send_virtual_key(VK_RETURN)?;
-                    enter_world_sent = true;
-                    println!(
-                        "应用 [{}] 已选择角色索引 {} 并触发进入游戏",
-                        app.name, wow_login.character_index
-                    );
-                    sleep(wow_login.after_enter_world_delay);
-                    return Ok(());
+                        sleep(wow_login.state_poll_interval);
+                    } else {
+                        let handle = open_process_for_wow(target_pid)?;
+                        let current_index_result =
+                            read_process_u32(handle, WOW_SELECTED_CHARACTER_INDEX_ADDRESS);
+                        let current_index = match current_index_result {
+                            Ok(value) => value,
+                            Err(err) => {
+                                close_handle(handle);
+                                return Err(err);
+                            }
+                        };
+                        if current_index != wow_login.character_index {
+                            if let Err(err) = write_process_u32(
+                                handle,
+                                WOW_SELECTED_CHARACTER_INDEX_ADDRESS,
+                                wow_login.character_index,
+                            ) {
+                                close_handle(handle);
+                                return Err(err);
+                            }
+                        }
+                        close_handle(handle);
+
+                        focus_window(hwnd);
+                        send_virtual_key(VK_RETURN)?;
+                        enter_world_started_at = Some(Instant::now());
+                        println!(
+                            "应用 [{}] 已选择角色索引 {} 并触发进入游戏，等待登录完成",
+                            app.name, wow_login.character_index
+                        );
+                        sleep(wow_login.state_poll_interval);
+                    }
                 }
                 _ => {
                     sleep(wow_login.state_poll_interval);
