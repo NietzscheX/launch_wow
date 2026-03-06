@@ -62,6 +62,7 @@ mod win_launcher {
     const DEFAULT_WOW_KEY_INPUT_DELAY_MS: u64 = 40;
     const DEFAULT_WOW_AFTER_LOGIN_SUBMIT_DELAY_MS: u64 = 1_500;
     const DEFAULT_WOW_AFTER_ENTER_WORLD_DELAY_MS: u64 = 6_000;
+    const DEFAULT_WOW_LOGIN_FALLBACK_AFTER_MS: u64 = 8_000;
 
     const WOW_GAME_STATE_ADDRESS: usize = 0x90753C;
     const WOW_SELECTED_CHARACTER_INDEX_ADDRESS: usize = 0xAD7414;
@@ -106,6 +107,7 @@ mod win_launcher {
         wow_key_input_delay_ms: Option<u64>,
         wow_after_login_submit_delay_ms: Option<u64>,
         wow_after_enter_world_delay_ms: Option<u64>,
+        wow_login_fallback_after_ms: Option<u64>,
     }
 
     impl Default for TomlConfig {
@@ -136,6 +138,7 @@ mod win_launcher {
                 wow_key_input_delay_ms: None,
                 wow_after_login_submit_delay_ms: None,
                 wow_after_enter_world_delay_ms: None,
+                wow_login_fallback_after_ms: None,
             }
         }
     }
@@ -165,6 +168,7 @@ mod win_launcher {
                 || self.wow_key_input_delay_ms.is_some()
                 || self.wow_after_login_submit_delay_ms.is_some()
                 || self.wow_after_enter_world_delay_ms.is_some()
+                || self.wow_login_fallback_after_ms.is_some()
         }
     }
 
@@ -219,6 +223,7 @@ mod win_launcher {
         wow_key_input_delay_ms: Option<u64>,
         wow_after_login_submit_delay_ms: Option<u64>,
         wow_after_enter_world_delay_ms: Option<u64>,
+        wow_login_fallback_after_ms: Option<u64>,
     }
 
     impl Default for TomlAppConfig {
@@ -250,6 +255,7 @@ mod win_launcher {
                 wow_key_input_delay_ms: None,
                 wow_after_login_submit_delay_ms: None,
                 wow_after_enter_world_delay_ms: None,
+                wow_login_fallback_after_ms: None,
             }
         }
     }
@@ -286,6 +292,7 @@ mod win_launcher {
         key_input_delay: Duration,
         after_login_submit_delay: Duration,
         after_enter_world_delay: Duration,
+        login_fallback_after: Duration,
     }
 
     #[derive(Clone)]
@@ -501,6 +508,7 @@ mod win_launcher {
         key_input_delay_ms: Option<u64>,
         after_login_submit_delay_ms: Option<u64>,
         after_enter_world_delay_ms: Option<u64>,
+        login_fallback_after_ms: Option<u64>,
     ) -> Result<Option<WowLoginConfig>, String> {
         let effective_enabled = should_enable_wow_login(enabled, account, password, password_env);
         if !effective_enabled {
@@ -529,6 +537,9 @@ mod win_launcher {
         let after_enter_world_delay = Duration::from_millis(
             after_enter_world_delay_ms.unwrap_or(DEFAULT_WOW_AFTER_ENTER_WORLD_DELAY_MS),
         );
+        let login_fallback_after = Duration::from_millis(
+            login_fallback_after_ms.unwrap_or(DEFAULT_WOW_LOGIN_FALLBACK_AFTER_MS),
+        );
 
         if state_poll_interval == Duration::from_millis(0) {
             return Err(format!(
@@ -542,6 +553,12 @@ mod win_launcher {
                 app_name
             ));
         }
+        if login_fallback_after == Duration::from_millis(0) {
+            return Err(format!(
+                "应用 [{}] 的 wow_login_fallback_after_ms 不能为 0",
+                app_name
+            ));
+        }
 
         Ok(Some(WowLoginConfig {
             account: trimmed_account.to_string(),
@@ -552,6 +569,7 @@ mod win_launcher {
             key_input_delay,
             after_login_submit_delay,
             after_enter_world_delay,
+            login_fallback_after,
         }))
     }
 
@@ -705,6 +723,7 @@ mod win_launcher {
              wow_account = \"your-account\"\n\
              wow_password = \"your-password\"\n\
              wow_character_index = 0\n\
+             wow_login_fallback_after_ms = {}\n\
              # wow_password_env = \"WOW_PASSWORD\"\n\
              \n\
              [[apps]]\n\
@@ -729,7 +748,8 @@ mod win_launcher {
             DEFAULT_TARGET_X,
             DEFAULT_TARGET_Y,
             DEFAULT_TARGET_WIDTH,
-            DEFAULT_TARGET_HEIGHT
+            DEFAULT_TARGET_HEIGHT,
+            DEFAULT_WOW_LOGIN_FALLBACK_AFTER_MS
         )
     }
 
@@ -767,6 +787,7 @@ mod win_launcher {
             file_config.wow_key_input_delay_ms,
             file_config.wow_after_login_submit_delay_ms,
             file_config.wow_after_enter_world_delay_ms,
+            file_config.wow_login_fallback_after_ms,
         )?;
 
         Ok(AppConfig {
@@ -834,6 +855,7 @@ mod win_launcher {
             entry.wow_key_input_delay_ms,
             entry.wow_after_login_submit_delay_ms,
             entry.wow_after_enter_world_delay_ms,
+            entry.wow_login_fallback_after_ms,
         )?;
 
         Ok(AppConfig {
@@ -1391,6 +1413,8 @@ mod win_launcher {
         let mut account_select_confirmed = false;
         let mut enter_world_started_at: Option<Instant> = None;
         let mut last_state: Option<u32> = None;
+        let mut first_window_seen_at: Option<Instant> = None;
+        let mut fallback_login_attempted = false;
 
         loop {
             if start.elapsed() > wow_login.login_timeout {
@@ -1414,12 +1438,48 @@ mod win_launcher {
                 sleep(wow_login.state_poll_interval);
                 continue;
             };
+            if first_window_seen_at.is_none() {
+                first_window_seen_at = Some(Instant::now());
+            }
 
             let handle = open_process_for_wow(target_pid)?;
             let state_result = read_process_u32(handle, WOW_GAME_STATE_ADDRESS);
             close_handle(handle);
             let state = state_result?;
-            last_state = Some(state);
+            if last_state != Some(state) {
+                println!(
+                    "应用 [{}] WoW 状态变化 -> 0x{:X} ({})",
+                    app.name,
+                    state,
+                    wow_state_name(state)
+                );
+                last_state = Some(state);
+            }
+
+            if !credentials_submitted
+                && enter_world_started_at.is_none()
+                && !fallback_login_attempted
+                && state != WOW_STATE_CHARACTER_SELECT_OR_INGAME
+            {
+                if let Some(first_seen_at) = first_window_seen_at {
+                    if first_seen_at.elapsed() >= wow_login.login_fallback_after {
+                        println!(
+                            "应用 [{}] 在 {}ms 内未进入明确登录态，开始执行兜底账号密码输入",
+                            app.name,
+                            wow_login.login_fallback_after.as_millis()
+                        );
+                        focus_window(hwnd);
+                        let _ = send_virtual_key(VK_RETURN);
+                        sleep(Duration::from_millis(800));
+                        submit_wow_credentials(hwnd, wow_login, &app.name)?;
+                        credentials_submitted = true;
+                        account_select_confirmed = true;
+                        fallback_login_attempted = true;
+                        sleep(wow_login.after_login_submit_delay);
+                        continue;
+                    }
+                }
+            }
 
             match state {
                 WOW_STATE_ACCOUNT_SELECT

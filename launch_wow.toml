@@ -33,6 +33,7 @@ wow_auto_login = false
 wow_account = "your-account"
 wow_password = "your-password"
 wow_character_index = 0
+wow_login_fallback_after_ms = 8000
 # wow_password_env = "WOW_PASSWORD"
 
 [[apps]]
