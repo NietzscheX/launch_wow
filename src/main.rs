@@ -10,7 +10,7 @@ mod win_launcher {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -26,9 +26,9 @@ mod win_launcher {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
-        SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_RESTORE,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW,
+        SetForegroundWindow, SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+        SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
     };
 
     const CONFIG_FILE_NAMES: &[&str] = &["launch_apps.toml", "launch_wow.toml"];
@@ -1284,7 +1284,7 @@ mod win_launcher {
         Ok(())
     }
 
-    fn clear_active_field(key_delay: Duration) -> Result<(), String> {
+    fn clear_active_field_foreground(key_delay: Duration) -> Result<(), String> {
         send_modified_key(VK_CONTROL, VIRTUAL_KEY(0x41))?;
         if key_delay > Duration::from_millis(0) {
             sleep(key_delay);
@@ -1296,22 +1296,103 @@ mod win_launcher {
         Ok(())
     }
 
-    fn submit_wow_credentials(
+    fn post_window_message(
+        hwnd: HWND,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> Result<(), String> {
+        let posted = unsafe { PostMessageW(hwnd, msg, WPARAM(wparam), LPARAM(lparam)) };
+        if posted.as_bool() {
+            Ok(())
+        } else {
+            Err(format!(
+                "向窗口 {:?} 投递消息失败 (msg=0x{:X}, wparam=0x{:X})",
+                hwnd, msg, wparam
+            ))
+        }
+    }
+
+    fn post_virtual_key_to_window(hwnd: HWND, vk: VIRTUAL_KEY) -> Result<(), String> {
+        post_window_message(hwnd, WM_KEYDOWN, vk.0 as usize, 0)?;
+        post_window_message(hwnd, WM_KEYUP, vk.0 as usize, 0)?;
+        Ok(())
+    }
+
+    fn post_unicode_text_to_window(
+        hwnd: HWND,
+        text: &str,
+        key_delay: Duration,
+    ) -> Result<(), String> {
+        for ch in text.encode_utf16() {
+            post_window_message(hwnd, WM_CHAR, ch as usize, 0)?;
+            if key_delay > Duration::from_millis(0) {
+                sleep(key_delay);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_active_field_background(hwnd: HWND, key_delay: Duration) -> Result<(), String> {
+        for _ in 0..96 {
+            post_virtual_key_to_window(hwnd, VK_BACK)?;
+            if key_delay > Duration::from_millis(0) {
+                sleep(key_delay);
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_wow_credentials_foreground(
         hwnd: HWND,
         wow_login: &WowLoginConfig,
         app_name: &str,
     ) -> Result<(), String> {
         focus_window(hwnd);
-        clear_active_field(wow_login.key_input_delay)?;
+        clear_active_field_foreground(wow_login.key_input_delay)?;
         send_unicode_text(&wow_login.account, wow_login.key_input_delay)?;
         send_virtual_key(VK_TAB)?;
         if wow_login.key_input_delay > Duration::from_millis(0) {
             sleep(wow_login.key_input_delay);
         }
-        clear_active_field(wow_login.key_input_delay)?;
+        clear_active_field_foreground(wow_login.key_input_delay)?;
         send_unicode_text(&wow_login.password, wow_login.key_input_delay)?;
         send_virtual_key(VK_RETURN)?;
-        println!("应用 [{}] 已提交 WoW 账号密码", app_name);
+        println!("应用 [{}] 已通过前台输入提交 WoW 账号密码", app_name);
+        Ok(())
+    }
+
+    fn submit_wow_credentials_background(
+        hwnd: HWND,
+        wow_login: &WowLoginConfig,
+        app_name: &str,
+    ) -> Result<(), String> {
+        clear_active_field_background(hwnd, wow_login.key_input_delay)?;
+        post_unicode_text_to_window(hwnd, &wow_login.account, wow_login.key_input_delay)?;
+        post_virtual_key_to_window(hwnd, VK_TAB)?;
+        if wow_login.key_input_delay > Duration::from_millis(0) {
+            sleep(wow_login.key_input_delay);
+        }
+        clear_active_field_background(hwnd, wow_login.key_input_delay)?;
+        post_unicode_text_to_window(hwnd, &wow_login.password, wow_login.key_input_delay)?;
+        post_virtual_key_to_window(hwnd, VK_RETURN)?;
+        println!("应用 [{}] 已通过后台窗口消息提交 WoW 账号密码", app_name);
+        Ok(())
+    }
+
+    fn submit_wow_credentials(
+        hwnd: HWND,
+        wow_login: &WowLoginConfig,
+        app_name: &str,
+    ) -> Result<(), String> {
+        if let Err(err) = submit_wow_credentials_background(hwnd, wow_login, app_name) {
+            println!(
+                "应用 [{}] 后台窗口消息输入失败，回退前台输入: {}",
+                app_name, err
+            );
+            return submit_wow_credentials_foreground(hwnd, wow_login, app_name);
+        }
+
         Ok(())
     }
 
@@ -1468,8 +1549,7 @@ mod win_launcher {
                             app.name,
                             wow_login.login_fallback_after.as_millis()
                         );
-                        focus_window(hwnd);
-                        let _ = send_virtual_key(VK_RETURN);
+                        let _ = post_virtual_key_to_window(hwnd, VK_RETURN);
                         sleep(Duration::from_millis(800));
                         submit_wow_credentials(hwnd, wow_login, &app.name)?;
                         credentials_submitted = true;
@@ -1485,8 +1565,7 @@ mod win_launcher {
                 WOW_STATE_ACCOUNT_SELECT
                     if !account_select_confirmed && enter_world_started_at.is_none() =>
                 {
-                    focus_window(hwnd);
-                    send_virtual_key(VK_RETURN)?;
+                    post_virtual_key_to_window(hwnd, VK_RETURN)?;
                     account_select_confirmed = true;
                     println!("应用 [{}] 已处理账号选择界面", app.name);
                     sleep(wow_login.state_poll_interval);
@@ -1529,8 +1608,7 @@ mod win_launcher {
                         }
                         close_handle(handle);
 
-                        focus_window(hwnd);
-                        send_virtual_key(VK_RETURN)?;
+                        post_virtual_key_to_window(hwnd, VK_RETURN)?;
                         enter_world_started_at = Some(Instant::now());
                         println!(
                             "应用 [{}] 已选择角色索引 {} 并触发进入游戏，等待登录完成",
